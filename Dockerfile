@@ -40,11 +40,11 @@ COPY --from=build --chown=monitor:monitor /app/dist/worker ./dist/worker
 USER monitor
 CMD ["node", "dist/worker/index.js"]
 
-# Migrations intentionally retain their CLI dependency but exclude application
-# source, test files, Git metadata, and local environment files.
+# The migration target uses the repository lockfile's production dependency
+# closure. It has no global install, source, tests, or development tooling.
 FROM runtime-base AS migrate
-COPY --from=dependencies --chown=monitor:monitor /app/node_modules ./node_modules
-COPY --from=build --chown=monitor:monitor /app/package.json ./package.json
-COPY --from=build --chown=monitor:monitor /app/db/migrations ./db/migrations
+COPY --from=production-dependencies --chown=monitor:monitor /app/node_modules ./node_modules
+COPY --chown=monitor:monitor package.json ./package.json
+COPY --chown=monitor:monitor db/migrations ./db/migrations
 USER monitor
-CMD ["npm", "run", "migrate"]
+CMD ["node", "node_modules/node-pg-migrate/bin/node-pg-migrate.js", "up", "--migrations-dir", "db/migrations", "--database-url-var", "MIGRATION_DATABASE_URL"]

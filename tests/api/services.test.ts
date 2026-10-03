@@ -1,12 +1,18 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const execFile = promisify(execFileCallback);
-const databaseUrl = process.env.API_TEST_DATABASE_URL ?? process.env.DATABASE_URL;
+const databaseUrl = process.env.API_TEST_DATABASE_URL;
 const describeWithDatabase = databaseUrl === undefined ? describe.skip : describe;
 const origin = "http://monitor.test";
+const runId = crypto.randomUUID();
+const fixtureServiceIds = new Set<string>();
+
+function testUrl(name: string): string {
+  return `https://${name}-${runId}.example.test/health`;
+}
 
 async function migrate(): Promise<void> {
   await execFile(
@@ -21,6 +27,7 @@ function mutation(url: string, method: "POST" | "DELETE", body?: unknown): Reque
     method,
     headers: {
       Origin: origin,
+      Host: "monitor.test",
       "Sec-Fetch-Site": "same-origin",
       ...(body === undefined ? {} : { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() }),
     },
@@ -35,13 +42,11 @@ describeWithDatabase("service API with PostgreSQL", () => {
     await migrate();
   });
 
-  beforeEach(async () => {
-    const { getPool } = await import("@/server/db");
-    await getPool().query("TRUNCATE services CASCADE");
-  });
-
   afterAll(async () => {
-    const { closePool } = await import("@/server/db");
+    const { closePool, getPool } = await import("@/server/db");
+    if (fixtureServiceIds.size > 0) {
+      await getPool().query("DELETE FROM services WHERE id = ANY($1::uuid[])", [[...fixtureServiceIds]]);
+    }
     await closePool();
   });
 
@@ -51,26 +56,31 @@ describeWithDatabase("service API with PostgreSQL", () => {
     const key = crypto.randomUUID();
     const request = () => new Request(`${origin}/api/services`, {
       method: "POST",
-      headers: { Origin: origin, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json", "Idempotency-Key": key },
-      body: JSON.stringify({ name: "Example", url: "https://example.com/health" }),
+      headers: { Origin: origin, Host: "monitor.test", "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json", "Idempotency-Key": key },
+      body: JSON.stringify({ name: "Example", url: testUrl("example") }),
     });
     const created = await POST(request());
     expect(created.status).toBe(201);
     expect(created.headers.get("location")).toMatch(/^\/api\/services\//);
     expect(created.headers.get("cache-control")).toContain("no-store");
     const service = (await created.json()) as { id: string; status: string };
+    fixtureServiceIds.add(service.id);
     expect(service.status).toBe("pending");
 
     const replay = await POST(request());
     expect(replay.status).toBe(200);
     expect(((await replay.json()) as { id: string }).id).toBe(service.id);
 
-    const listed = await list();
+    const listed = await list(new Request(`${origin}/api/services`, { headers: { Host: "monitor.test" } }));
     expect(listed.status).toBe(200);
-    expect(((await listed.json()) as { counts: { pending: number } }).counts.pending).toBe(1);
+    expect(((await listed.json()) as { counts: { pending: number } }).counts.pending).toBeGreaterThanOrEqual(1);
 
     const context = { params: Promise.resolve({ id: service.id }) };
-    expect((await detail.GET(new Request(`${origin}/api/services/${service.id}`), context)).status).toBe(200);
+    const detailResponse = await detail.GET(new Request(`${origin}/api/services/${service.id}`, { headers: { Host: "monitor.test" } }), context);
+    expect(detailResponse.status).toBe(200);
+    const detailedService = (await detailResponse.json()) as { history: Array<{ completedChecks: number }> };
+    expect(detailedService.history).toHaveLength(24);
+    expect(detailedService.history.every((bucket) => bucket.completedChecks === 0)).toBe(true);
     expect((await detail.DELETE(mutation(`${origin}/api/services/${service.id}`, "DELETE"), context)).status).toBe(204);
     expect((await detail.DELETE(mutation(`${origin}/api/services/${service.id}`, "DELETE"), context)).status).toBe(204);
   });
@@ -80,12 +90,21 @@ describeWithDatabase("service API with PostgreSQL", () => {
     const crossOrigin = await POST(
       new Request(`${origin}/api/services`, {
         method: "POST",
-        headers: { Origin: "https://attacker.invalid", "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        headers: { Origin: "https://attacker.invalid", Host: "monitor.test", "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
         body: "{}",
       }),
     );
     expect(crossOrigin.status).toBe(403);
     expect(((await crossOrigin.json()) as { error: { code: string; requestId: string } }).error.code).toBe("ORIGIN_FORBIDDEN");
+
+    const wrongHost = await POST(
+      new Request(`${origin}/api/services`, {
+        method: "POST",
+        headers: { Origin: origin, Host: "attacker.invalid", "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({ name: "Wrong host", url: testUrl("wrong-host") }),
+      }),
+    );
+    expect(wrongHost.status).toBe(403);
 
     const invalid = await POST(mutation(`${origin}/api/services`, "POST", { name: "", url: "not a URL" }));
     expect(invalid.status).toBe(422);
@@ -95,6 +114,7 @@ describeWithDatabase("service API with PostgreSQL", () => {
   it("reports liveness and migrated database readiness without caching", async () => {
     const live = await import("@/app/api/health/live/route");
     const ready = await import("@/app/api/health/ready/route");
+    // Probe routes take no request dependency, so an orchestrator need not supply Host.
     const liveResponse = live.GET();
     expect(liveResponse.status).toBe(200);
     expect(liveResponse.headers.get("cache-control")).toContain("no-store");
@@ -106,8 +126,9 @@ describeWithDatabase("service API with PostgreSQL", () => {
   it("uses an anchored keyset cursor for exact history", async () => {
     const { POST } = await import("@/app/api/services/route");
     const history = await import("@/app/api/services/[id]/history/route");
-    const created = await POST(mutation(`${origin}/api/services`, "POST", { name: "History", url: "https://example.org/status" }));
+    const created = await POST(mutation(`${origin}/api/services`, "POST", { name: "History", url: testUrl("history") }));
     const service = (await created.json()) as { id: string };
+    fixtureServiceIds.add(service.id);
     const { getPool } = await import("@/server/db");
     await getPool().query(
       `
@@ -121,7 +142,7 @@ describeWithDatabase("service API with PostgreSQL", () => {
       [service.id],
     );
     const context = { params: Promise.resolve({ id: service.id }) };
-    const first = await history.GET(new Request(`${origin}/api/services/${service.id}/history?range=24h&limit=1`), context);
+    const first = await history.GET(new Request(`${origin}/api/services/${service.id}/history?range=24h&limit=1`, { headers: { Host: "monitor.test" } }), context);
     const firstBody = (await first.json()) as { asOf: string; checks: Array<{ id: string }>; nextCursor: string | null };
     expect(firstBody.checks).toHaveLength(1);
     expect(firstBody.nextCursor).not.toBeNull();
@@ -131,7 +152,7 @@ describeWithDatabase("service API with PostgreSQL", () => {
        VALUES ($1, gen_random_uuid(), now() + interval '1 minute', now() + interval '1 minute', now() + interval '1 minute', 'up', 200, 12, 12, NULL, 200, 299)`,
       [service.id],
     );
-    const second = await history.GET(new Request(`${origin}/api/services/${service.id}/history?range=24h&limit=1&cursor=${encodeURIComponent(firstBody.nextCursor!)}`), context);
+    const second = await history.GET(new Request(`${origin}/api/services/${service.id}/history?range=24h&limit=1&cursor=${encodeURIComponent(firstBody.nextCursor!)}`, { headers: { Host: "monitor.test" } }), context);
     const secondBody = (await second.json()) as { asOf: string; checks: Array<{ id: string }> };
     expect(secondBody.asOf).toBe(firstBody.asOf);
     expect(secondBody.checks).toHaveLength(1);

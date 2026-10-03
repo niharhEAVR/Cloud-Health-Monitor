@@ -61,9 +61,9 @@ cp .env.example .env
 | `WORKER_SHUTDOWN_GRACE_MS` | In-process worker drain period in milliseconds (1–120,000). | `25000` |
 | `MAX_SERVICES` | Service creation capacity guard (1–10,000). | `100` |
 
-All application values are validated at startup. In production, create distinct runtime and migration roles: the runtime role should have only the table permissions it needs, while the migration role owns schema changes. The example uses one local role only to make Compose convenient.
+All application values are validated at startup. In production, create distinct runtime and migration roles: the runtime role should have only the table permissions it needs, while the migration role owns schema changes. The example uses one local role only to make Compose convenient. Compose interpolates `.env` but injects `DATABASE_URL` only into web/worker, `MIGRATION_DATABASE_URL` only into the one-shot migration job, and the `POSTGRES_*` initialization values only into PostgreSQL.
 
-When deployed behind TLS termination, set `APP_ORIGIN` to the externally visible `https://` origin and configure the reverse proxy to enforce that host, HTTPS, body-size limits, and any request limiting/access policy. The bundled Compose port is intentionally bound to `127.0.0.1:3000`; publish it through a trusted local proxy rather than changing it to `0.0.0.0`.
+When deployed behind TLS termination, set `APP_ORIGIN` to the externally visible `https://` origin and configure the reverse proxy to enforce that host, HTTPS, body-size limits, and any request limiting/access policy. Data API routes validate the request `Host` against `APP_ORIGIN`, so the proxy **must forward the original public Host** rather than replacing it with `localhost` or the upstream container name (for example, Nginx: `proxy_set_header Host $host;`). The liveness and readiness endpoints are deliberately host-agnostic, so platform probes remain safe; the bundled Compose healthcheck still supplies the configured host for a deployment-consistent check. The bundled Compose port is intentionally bound to `127.0.0.1:3000`; publish it through a trusted local proxy rather than changing it to `0.0.0.0`.
 
 ## Run with Docker Compose
 
@@ -114,6 +114,7 @@ Run PostgreSQL 17 locally (outside Compose) and point both database variables at
 npm ci
 cp .env.example .env
 # Edit DATABASE_URL and MIGRATION_DATABASE_URL to use 127.0.0.1 for local PostgreSQL.
+set -a; . ./.env; set +a
 npm run migrate
 npm run dev
 ```
@@ -121,6 +122,8 @@ npm run dev
 In a second terminal, start the worker with the project's worker script:
 
 ```sh
+npm run build:worker
+set -a; . ./.env; set +a
 npm run worker
 ```
 
@@ -134,7 +137,7 @@ To reset only local development schema, use the migration tooling deliberately; 
 
 The worker claims due work through PostgreSQL, so no Redis or external queue is needed. The default worker concurrency is five and each attempt has a ten-second total deadline. A graceful shutdown stops new claims, lets in-flight work finish within its grace period, aborts remaining work, releases only its own leases, and drains database work.
 
-History retention is 90 days. Cleanup runs in bounded batches and history queries also enforce the 90-day cutoff, even if cleanup is temporarily delayed. Retention bounds **age**, not disk size: at the minimum 60-second default interval, 100 continuously monitored services can create roughly 144,000 raw checks per day (about 13 million over 90 days), before indexes and hourly summaries. Start below `MAX_SERVICES=100`, measure PostgreSQL disk/IO and worker scheduling lag, and increase capacity only after sizing the database, connection limits, and outbound network budget.
+History retention is 90 days. Cleanup runs in bounded batches and history queries also enforce the 90-day cutoff, even if cleanup is temporarily delayed. Retention bounds **age**, not disk size: at the 30-second minimum interval, 100 continuously monitored services can create roughly 288,000 raw checks per day (about 25.9 million over 90 days), before indexes and hourly summaries. At the 60-second default, that is roughly 144,000 per day (about 13 million over 90 days). Start below `MAX_SERVICES=100`, measure PostgreSQL disk/IO and worker scheduling lag, and increase capacity only after sizing the database, connection limits, and outbound network budget.
 
 Logs are structured JSON on stdout/stderr. Forward those streams using the platform's normal log collection. Compose uses Docker's local log driver with a 10 MiB × 3-file bound per container; configure central log retention independently if required.
 
@@ -189,9 +192,11 @@ npm run typecheck
 npm run test
 npm run build
 docker compose build
+docker compose up -d --wait
+npm run test:e2e
 ```
 
-The GitHub Actions workflow provisions PostgreSQL 17 and runs linting, strict type checking, the Vitest suite (including API and worker coverage as it is added), a production build, Docker target builds, and focused browser/Compose smoke coverage. It uses local PostgreSQL and deterministic fixtures rather than paid services or public internet targets.
+The GitHub Actions workflow provisions a disposable PostgreSQL 17 database and runs linting, strict type checking, explicit API/worker database tests, production builds, and Docker target builds. It also starts the local Compose stack, verifies its health endpoints, and runs the checked-in desktop/mobile Playwright journeys against its dashboard. Those browser journeys mock their API responses intentionally, while the Compose health checks cover the actual local API/database path. It does not require paid services or public internet targets.
 
 ## Troubleshooting
 

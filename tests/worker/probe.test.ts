@@ -1,9 +1,10 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
+import { createServer, request as nativeRequest } from "node:http";
 import type { ClientRequest, IncomingMessage, RequestOptions } from "node:http";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { probeHttp } from "@/worker/probe";
+import { createPinnedLookup, probeHttp } from "@/worker/probe";
 
 function response(statusCode: number): IncomingMessage {
   return Object.assign(new EventEmitter(), {
@@ -67,6 +68,54 @@ describe("safe HTTP probe", () => {
 
     expect(result).toMatchObject({ ok: true, httpStatus: 302 });
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("pins a bracketed public IPv6 literal without trying DNS", async () => {
+    let options: RequestOptions | undefined;
+    const resolver = { resolve4: vi.fn(), resolve6: vi.fn() };
+    const result = await probeHttp("http://[2606:4700:4700::1111]/health", 1_000, {
+      resolver,
+      request: successfulRequest(204, (value) => { options = value; }),
+    });
+
+    expect(result).toMatchObject({ ok: true, httpStatus: 204 });
+    expect(options?.hostname).toBe("2606:4700:4700::1111");
+    expect(resolver.resolve4).not.toHaveBeenCalled();
+    expect(resolver.resolve6).not.toHaveBeenCalled();
+  });
+
+  it("uses Node 24's all-address lookup callback shape with a real socket", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(204).end();
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Expected a TCP test server.");
+    let requestedAll = false;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const request = nativeRequest({
+          hostname: "pinned.invalid",
+          port: String(address.port),
+          agent: false,
+          autoSelectFamily: true,
+          lookup: (hostname, options, callback) => {
+            requestedAll ||= options.all === true;
+            createPinnedLookup("127.0.0.1", 4)(hostname, options, callback);
+          },
+        } as RequestOptions & { autoSelectFamily: boolean }, (response) => {
+          response.resume();
+          response.once("end", resolve);
+        });
+        request.once("error", reject);
+        request.end();
+      });
+      expect(requestedAll).toBe(true);
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
   });
 
   it("rejects DNS rebinding answer sets before opening a socket", async () => {

@@ -13,7 +13,12 @@ export function statusLabel(status: DisplayStatus): string {
 
 export function formatAvailability(value: number | null): string {
   if (value === null) return "—";
-  return `${(value * 100).toFixed(value * 100 >= 99.95 ? 0 : 2)}%`;
+  const percent = Math.max(0, Math.min(100, value * 100));
+  // Do not round a failed window up to 100%; that would claim no failures.
+  if (percent > 0 && percent < 100 && percent >= 99.95) {
+    return `${(Math.floor(percent * 100) / 100).toFixed(2)}%`;
+  }
+  return `${percent.toFixed(percent === 100 ? 0 : 2)}%`;
 }
 
 export function formatDuration(value: number | null): string {

@@ -27,6 +27,12 @@ export function hasAllowedMutationOrigin(request: Request, appOrigin = parseServ
   return fetchSite === null || fetchSite === "same-origin" || fetchSite === "none";
 }
 
+/** Reject host-header routing to an origin other than the configured application. */
+export function hasAllowedApiHost(request: Request, appOrigin = parseServerEnv().APP_ORIGIN): boolean {
+  const host = request.headers.get("host");
+  return host !== null && host.toLowerCase() === new URL(appOrigin).host.toLowerCase();
+}
+
 export function isJsonRequest(request: Request): boolean {
   const contentType = request.headers.get("content-type");
   return contentType?.toLowerCase().startsWith("application/json") ?? false;

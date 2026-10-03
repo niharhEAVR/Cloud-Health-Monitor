@@ -4,16 +4,17 @@ import type { ReactNode } from "react";
 import { bucketState, statusLabel } from "@/lib/monitor-format";
 import type { DisplayStatus, HistoryBucket } from "@/lib/monitor-types";
 
-export function AppHeader({ workerDelayed = false }: { workerDelayed?: boolean }) {
+export type WorkerState = "online" | "delayed" | "unknown";
+
+export function AppHeader({ workerState }: { workerState?: WorkerState | undefined }) {
+  const label = workerState === "online" ? "Worker online" : workerState === "delayed" ? "Worker delayed" : "Worker status unavailable";
   return (
     <header className="topbar">
       <Link className="brand" href="/" aria-label="Cloud Health Monitor dashboard">
         <span className="logo" aria-hidden="true"><i /><i /><i /></span>
         <span>Cloud Health Monitor</span>
       </Link>
-      <span className={`worker-state${workerDelayed ? " delayed" : ""}`}>
-        <i aria-hidden="true" />{workerDelayed ? "Worker delayed" : "Worker online"}
-      </span>
+      {workerState ? <span className={`worker-state ${workerState}`}><i aria-hidden="true" />{label}</span> : null}
     </header>
   );
 }
@@ -26,7 +27,7 @@ export function HistoryStrip({ buckets, label }: { buckets: HistoryBucket[]; lab
   const visible = buckets.slice(-24);
   const stateWords = visible.map(bucketState);
   return (
-    <div className="history-strip" role="img" aria-label={`${label}: ${stateWords.filter((state) => state === "up").length} passed, ${stateWords.filter((state) => state === "down").length} failed, ${stateWords.filter((state) => state === "none").length} with no checks`}>
+    <div className="history-strip" role="img" aria-label={`${label}: ${stateWords.filter((state) => state === "up").length} time buckets with all completed checks accepted, ${stateWords.filter((state) => state === "down").length} buckets with one or more rejected checks, ${stateWords.filter((state) => state === "none").length} buckets with no completed checks`}>
       {visible.length ? visible.map((bucket, index) => <i className={bucketState(bucket)} key={`${bucket.startAt}-${index}`} />) : <i className="none placeholder" />}
     </div>
   );

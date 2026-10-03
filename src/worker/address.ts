@@ -37,7 +37,8 @@ const blockedIpv4Cidrs: ReadonlyArray<readonly [number, number]> = [
   [0xc6120000, 15], // benchmark testing
   [0xc6336400, 24], // documentation
   [0xcb007100, 24], // documentation
-  [0xe0000000, 4], // multicast and reserved
+  [0xe0000000, 4], // multicast
+  [0xf0000000, 4], // reserved, including limited broadcast
 ];
 
 function ipv6Number(address: string): bigint | null {
@@ -91,19 +92,21 @@ const blockedIpv6Cidrs: ReadonlyArray<readonly [bigint, number]> = [
   [ipv6("20000000000000000000000000000000"), 23], // IETF special-purpose ranges
   [BigInt("0x20010db8") << 96n, 32], // documentation
   [ipv6("20020000000000000000000000000000"), 16], // 6to4, embeds unvalidated IPv4
+  [BigInt("0x3fff") << 112n, 20], // documentation and future-reserved allocation
   [ipv6("fc000000000000000000000000000000"), 7], // unique local
   [ipv6("fe800000000000000000000000000000"), 10], // link-local
   [ipv6("ff000000000000000000000000000000"), 8], // multicast
 ];
 
 export function isPublicAddress(address: string): boolean {
-  const family = isIP(address);
+  const literal = address.startsWith("[") && address.endsWith("]") ? address.slice(1, -1) : address;
+  const family = isIP(literal);
   if (family === 4) {
-    const numeric = ipv4Number(address);
+    const numeric = ipv4Number(literal);
     return numeric !== null && !blockedIpv4Cidrs.some(([network, prefix]) => inIpv4Cidr(numeric, network, prefix));
   }
   if (family === 6) {
-    const numeric = ipv6Number(address);
+    const numeric = ipv6Number(literal);
     return (
       numeric !== null &&
       inIpv6Cidr(numeric, ipv6("20000000000000000000000000000000"), 3) &&

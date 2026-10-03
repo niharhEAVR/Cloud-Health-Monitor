@@ -80,6 +80,27 @@ interface WorkerRow {
   scheduler_ran_at: Date | null;
 }
 
+interface ServiceSummaryRow {
+  id: string;
+  name: string;
+  normalized_url: string;
+  interval_seconds: number;
+  accepted_status_min: number;
+  accepted_status_max: number;
+  created_at: Date;
+  updated_at: Date;
+  next_check_at: Date;
+  latest_scheduled_at: Date | null;
+  latest_completed_at: Date | null;
+  latest_outcome: "up" | "down" | null;
+  latest_http_status: number | null;
+  latest_response_time_ms: number | null;
+  latest_duration_ms: number | null;
+  latest_error_code: string | null;
+  completed_checks: string;
+  accepted_checks: string;
+}
+
 interface CheckRow {
   id: string;
   scheduled_at: Date;
@@ -93,6 +114,33 @@ interface CheckRow {
 
 function iso(value: Date): string {
   return value.toISOString();
+}
+
+function serviceFromSummaryRow(row: ServiceSummaryRow): ServiceRecord {
+  return {
+    id: row.id,
+    name: row.name,
+    normalizedUrl: row.normalized_url,
+    intervalSeconds: row.interval_seconds,
+    acceptedStatusMin: row.accepted_status_min,
+    acceptedStatusMax: row.accepted_status_max,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    nextCheckAt: row.next_check_at,
+    latestScheduledAt: row.latest_scheduled_at,
+    latestCompletedAt: row.latest_completed_at,
+    latestOutcome: row.latest_outcome,
+    latestHttpStatus: row.latest_http_status,
+    latestResponseTimeMs: row.latest_response_time_ms,
+    latestDurationMs: row.latest_duration_ms,
+    latestErrorCode: row.latest_error_code,
+  };
+}
+
+export async function getDatabaseNow(): Promise<Date> {
+  const row = await queryOne<{ now: Date }>(getPool(), "SELECT current_timestamp AS now");
+  if (row === null) throw new Error("Database clock query did not return a row.");
+  return row.now;
 }
 
 function lastCheck(service: ServiceRecord): CheckView | null {
@@ -162,17 +210,33 @@ async function availabilityByService(serviceIds: string[], now: Date): Promise<M
 async function compactHistoryByService(serviceIds: string[], now: Date): Promise<Map<string, HistoryBucket[]>> {
   const histories = new Map<string, HistoryBucket[]>();
   if (serviceIds.length === 0) return histories;
-  const since = new Date(now.getTime() - HISTORY_WINDOW_MS);
+  const hourMs = 60 * 60 * 1_000;
+  const currentHour = new Date(Math.floor(now.getTime() / hourMs) * hourMs);
+  const since = new Date(currentHour.getTime() - 23 * hourMs);
+  for (const serviceId of serviceIds) {
+    histories.set(serviceId, Array.from({ length: 24 }, (_, index) => {
+      const startsAt = new Date(since.getTime() + index * hourMs);
+      return {
+        startAt: iso(startsAt),
+        startsAt: iso(startsAt),
+        endsAt: iso(new Date(startsAt.getTime() + hourMs)),
+        completedChecks: 0,
+        acceptedChecks: 0,
+        availability: null,
+        averageResponseTimeMs: null,
+      };
+    }));
+  }
   const result = await getPool().query<CompactBucketRow>(
     `
-      SELECT service_id, date_trunc('hour', completed_at) AS hour_start,
+      SELECT service_id, (date_trunc('hour', completed_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS hour_start,
              count(*)::text AS completed_checks,
              count(*) FILTER (WHERE outcome = 'up')::text AS accepted_checks,
              count(response_time_ms)::text AS response_time_count,
              coalesce(sum(response_time_ms), 0)::text AS response_time_sum_ms
       FROM health_checks
       WHERE service_id = ANY($1::uuid[]) AND completed_at >= $2 AND completed_at <= $3
-      GROUP BY service_id, date_trunc('hour', completed_at)
+      GROUP BY service_id, (date_trunc('hour', completed_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
       ORDER BY service_id, hour_start
     `,
     [serviceIds, since, now],
@@ -180,23 +244,24 @@ async function compactHistoryByService(serviceIds: string[], now: Date): Promise
   for (const row of result.rows) {
     const completedChecks = Number(row.completed_checks);
     const responseTimeCount = Number(row.response_time_count);
-    const bucket: HistoryBucket = {
+    const bucketIndex = Math.round((row.hour_start.getTime() - since.getTime()) / hourMs);
+    const current = histories.get(row.service_id);
+    if (current === undefined || bucketIndex < 0 || bucketIndex >= current.length) continue;
+    current[bucketIndex] = {
       startAt: iso(row.hour_start),
       startsAt: iso(row.hour_start),
-      endsAt: iso(new Date(row.hour_start.getTime() + 60 * 60 * 1_000)),
+      endsAt: iso(new Date(row.hour_start.getTime() + hourMs)),
       completedChecks,
       acceptedChecks: Number(row.accepted_checks),
       availability: calculateAvailability(Number(row.accepted_checks), completedChecks),
       averageResponseTimeMs: responseTimeCount === 0 ? null : Number(row.response_time_sum_ms) / responseTimeCount,
     };
-    const current = histories.get(row.service_id) ?? [];
-    current.push(bucket);
-    histories.set(row.service_id, current);
   }
   return histories;
 }
 
-export async function getWorkerSummary(now = new Date()): Promise<WorkerSummary> {
+export async function getWorkerSummary(now?: Date): Promise<WorkerSummary> {
+  const snapshotAt = now ?? await getDatabaseNow();
   const row = await queryOne<WorkerRow>(
     getPool(),
     `
@@ -208,31 +273,51 @@ export async function getWorkerSummary(now = new Date()): Promise<WorkerSummary>
   return {
     lastSeenAt: lastSeenAt === null ? null : iso(lastSeenAt),
     schedulerRanAt: row?.scheduler_ran_at === null || row?.scheduler_ran_at === undefined ? null : iso(row.scheduler_ran_at),
-    isFresh: lastSeenAt !== null && now.getTime() - lastSeenAt.getTime() <= WORKER_FRESH_MS,
+    isFresh: lastSeenAt !== null && snapshotAt.getTime() - lastSeenAt.getTime() <= WORKER_FRESH_MS,
   };
 }
 
-export async function getServiceSummaries(now = new Date()): Promise<ServiceSummary[]> {
+export async function getServiceSummaries(now?: Date): Promise<ServiceSummary[]> {
+  const snapshotAt = now ?? await getDatabaseNow();
   const maxServices = parseServerEnv().MAX_SERVICES;
-  const result = await getPool().query(
-    `SELECT id FROM services ORDER BY name ASC, id ASC LIMIT $1`,
-    [maxServices],
+  const result = await getPool().query<ServiceSummaryRow>(
+    `
+      WITH selected_services AS (
+        SELECT * FROM services ORDER BY name ASC, id ASC LIMIT $1
+      ), availability AS (
+        SELECT checks.service_id, count(*)::text AS completed_checks,
+               count(*) FILTER (WHERE checks.outcome = 'up')::text AS accepted_checks
+        FROM health_checks AS checks
+        JOIN selected_services AS service ON service.id = checks.service_id
+        WHERE checks.completed_at >= $2 AND checks.completed_at <= $3
+        GROUP BY checks.service_id
+      )
+      SELECT service.*, coalesce(availability.completed_checks, '0') AS completed_checks,
+             coalesce(availability.accepted_checks, '0') AS accepted_checks
+      FROM selected_services AS service
+      LEFT JOIN availability ON availability.service_id = service.id
+      ORDER BY service.name ASC, service.id ASC
+    `,
+    [maxServices, new Date(snapshotAt.getTime() - HISTORY_WINDOW_MS), snapshotAt],
   );
-  const services = await Promise.all(result.rows.map((row) => findServiceById(getPool(), row.id)));
-  const records = services.filter((service): service is ServiceRecord => service !== null);
+  const records = result.rows.map(serviceFromSummaryRow);
   const ids = records.map((service) => service.id);
-  const [availability, histories] = await Promise.all([availabilityByService(ids, now), compactHistoryByService(ids, now)]);
-  return records.map((service) => mapSummary(service, now, availability.get(service.id) ?? null, histories.get(service.id) ?? []));
+  const histories = await compactHistoryByService(ids, snapshotAt);
+  return records.map((service, index) => {
+    const counts = result.rows[index]!;
+    return mapSummary(service, snapshotAt, calculateAvailability(Number(counts.accepted_checks), Number(counts.completed_checks)), histories.get(service.id) ?? []);
+  });
 }
 
-export async function getServiceSummary(id: string, now = new Date()): Promise<ServiceSummary | null> {
+export async function getServiceSummary(id: string, now?: Date): Promise<ServiceSummary | null> {
+  const snapshotAt = now ?? await getDatabaseNow();
   const service = await findServiceById(getPool(), id);
   if (service === null) return null;
   const [availability, histories] = await Promise.all([
-    availabilityByService([id], now),
-    compactHistoryByService([id], now),
+    availabilityByService([id], snapshotAt),
+    compactHistoryByService([id], snapshotAt),
   ]);
-  return mapSummary(service, now, availability.get(id) ?? null, histories.get(id) ?? []);
+  return mapSummary(service, snapshotAt, availability.get(id) ?? null, histories.get(id) ?? []);
 }
 
 export async function createService(input: CreateServiceInput): Promise<{ created: boolean; service: ServiceSummary }> {
@@ -246,9 +331,11 @@ export async function createService(input: CreateServiceInput): Promise<{ create
   if (result.kind === "capacity_reached") {
     throw new AppError({ code: "SERVICE_LIMIT_REACHED", message: "The configured service limit has been reached.", status: 409 });
   }
+  const service = await getServiceSummary(result.service.id);
+  if (service === null) throw new Error("Created service could not be read.");
   return {
     created: result.kind === "created",
-    service: mapSummary(result.service, new Date(), null, []),
+    service,
   };
 }
 
@@ -290,6 +377,7 @@ export function parseHistoryCursor(value: string, serviceId: string, range: stri
       parsed.serviceId !== serviceId || parsed.range !== range ||
       typeof parsed.asOf !== "string" || typeof parsed.beforeCompletedAt !== "string" || typeof parsed.beforeId !== "string" ||
       Number.isNaN(Date.parse(parsed.asOf)) || Number.isNaN(Date.parse(parsed.beforeCompletedAt)) ||
+      Date.parse(parsed.beforeCompletedAt) > Date.parse(parsed.asOf) ||
       !ServiceIdSchema.safeParse(parsed.beforeId).success
     ) {
       throw new Error("Invalid cursor");
@@ -320,22 +408,30 @@ export async function getHistoryPage(options: {
   cursor?: HistoryCursor;
   now?: Date;
 }): Promise<HistoryPage | null> {
-  const service = await findServiceById(getPool(), options.serviceId);
+  const [service, databaseTimestamp] = await Promise.all([findServiceById(getPool(), options.serviceId), getDatabaseNow()]);
   if (service === null) return null;
-  const asOf = options.cursor === undefined ? options.now ?? new Date() : new Date(options.cursor.asOf);
+  const asOf = options.cursor === undefined ? options.now ?? databaseTimestamp : new Date(options.cursor.asOf);
+  const cursorBefore = options.cursor === undefined ? null : new Date(options.cursor.beforeCompletedAt);
+  const retentionStart = new Date(databaseTimestamp.getTime() - 90 * 24 * 60 * 60 * 1_000);
+  if (
+    asOf.getTime() > databaseTimestamp.getTime() || asOf.getTime() < retentionStart.getTime() ||
+    (cursorBefore !== null && (cursorBefore.getTime() > asOf.getTime() || cursorBefore.getTime() < new Date(asOf.getTime() - rangeMilliseconds(options.range)).getTime()))
+  ) {
+    throw new AppError({ code: "VALIDATION_ERROR", message: "Cursor anchor is invalid.", status: 422, fieldErrors: { cursor: ["Cursor anchor is invalid."] } });
+  }
   const from = new Date(asOf.getTime() - rangeMilliseconds(options.range));
   const size = bucketMilliseconds(options.range);
   const bucketStart = floorBucket(from, size);
   const bucketResult = await getPool().query<CompactBucketRow>(
     `
-      SELECT service_id, date_trunc($4, completed_at) AS hour_start,
+      SELECT service_id, (date_trunc($4, completed_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS hour_start,
              count(*)::text AS completed_checks,
              count(*) FILTER (WHERE outcome = 'up')::text AS accepted_checks,
              count(response_time_ms)::text AS response_time_count,
              coalesce(sum(response_time_ms), 0)::text AS response_time_sum_ms
       FROM health_checks
       WHERE service_id = $1 AND completed_at >= $2 AND completed_at <= $3
-      GROUP BY service_id, date_trunc($4, completed_at)
+      GROUP BY service_id, (date_trunc($4, completed_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
       ORDER BY hour_start ASC
     `,
     [options.serviceId, from, asOf, size === 60 * 60 * 1_000 ? "hour" : "day"],

@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import { Pool } from "pg";
 
-import { parseWorkerEnv, type WorkerEnv } from "./config.js";
-import { createLogger, redactTargetUrl, type WorkerLogger } from "./log.js";
+import { parseWorkerEnv, PROBE_DEADLINE_MS, type WorkerEnv } from "./config.js";
+import { boundedErrorCode, createLogger, redactTargetUrl, type WorkerLogger } from "./log.js";
 import { probeHttp, type ProbeDependencies } from "./probe.js";
 import {
   claimDueServices,
@@ -11,6 +12,7 @@ import {
   releaseWorkerLeases,
   runRetentionCleanup,
   writeHeartbeat,
+  writeSchedulerPass,
   type ClaimedService,
   type CompletedProbe,
 } from "./repository.js";
@@ -21,7 +23,7 @@ export class WorkerRuntime {
   private readonly active = new Map<Promise<void>, AbortController>();
   private readonly logger: WorkerLogger;
   private readonly pool: Pool;
-  private schedulerRunning = false;
+  private schedulerTick: Promise<void> | undefined;
   private stopping = false;
   private pollTimer: NodeJS.Timeout | undefined;
   private heartbeatTimer: NodeJS.Timeout | undefined;
@@ -40,7 +42,9 @@ export class WorkerRuntime {
     });
     this.logger = options.logger ?? createLogger(config);
     this.probeDependencies = options.probeDependencies;
-    this.pool.on("error", () => this.logger("error", "worker.database.idle_client_error"));
+    this.pool.on("error", (error) => this.logger("error", "worker.database.idle_client_error", {
+      errorCode: boundedErrorCode(error),
+    }));
   }
 
   private readonly probeDependencies: ProbeDependencies | undefined;
@@ -48,8 +52,11 @@ export class WorkerRuntime {
   async start(): Promise<void> {
     this.logger("info", "worker.started", { workerId: this.workerId, concurrency: this.config.WORKER_CONCURRENCY });
     await this.heartbeat();
+    if (this.stopping) return;
     await this.cleanup();
+    if (this.stopping) return;
     await this.tick();
+    if (this.stopping) return;
     this.pollTimer = setInterval(() => void this.tick(), this.config.WORKER_POLL_INTERVAL_MS);
     this.heartbeatTimer = setInterval(() => void this.heartbeat(), 10_000);
     this.retentionTimer = setInterval(() => void this.cleanup(), 60 * 60 * 1_000);
@@ -63,20 +70,24 @@ export class WorkerRuntime {
     this.clearTimers();
     this.logger("info", "worker.stopping", { workerId: this.workerId, inFlight: this.active.size });
 
-    const current = [...this.active.keys()];
-    await Promise.race([
-      Promise.allSettled(current),
-      new Promise<void>((resolve) => setTimeout(resolve, this.config.WORKER_SHUTDOWN_GRACE_MS)),
-    ]);
+    const shutdownDeadline = performance.now() + this.config.WORKER_SHUTDOWN_GRACE_MS;
+    const schedulerSettled = await this.waitForSchedulerTick(shutdownDeadline);
+    await this.waitForActiveWork(shutdownDeadline);
     for (const controller of this.active.values()) {
       controller.abort();
     }
-    await Promise.allSettled([...this.active.keys()]);
+    await this.waitForActiveWork(shutdownDeadline);
     try {
-      const released = await releaseWorkerLeases(this.pool, this.workerId);
-      this.logger("info", "worker.leases_released", { workerId: this.workerId, released });
+      if (schedulerSettled) {
+        const released = await releaseWorkerLeases(this.pool, this.workerId);
+        this.logger("info", "worker.leases_released", { workerId: this.workerId, released });
+      } else {
+        // Do not race a late claim transaction. Its short lease will expire if
+        // the database remains unavailable beyond the graceful deadline.
+        this.logger("warn", "worker.lease_release_skipped", { workerId: this.workerId, reason: "scheduler_tick_timeout" });
+      }
     } finally {
-      await this.pool.end();
+      await this.endPool(shutdownDeadline);
     }
     this.logger("info", "worker.stopped", { workerId: this.workerId });
   }
@@ -90,27 +101,68 @@ export class WorkerRuntime {
     this.retentionTimer = undefined;
   }
 
-  private async tick(): Promise<void> {
-    if (this.stopping || this.schedulerRunning) {
-      return;
+  private async waitForSchedulerTick(deadline: number): Promise<boolean> {
+    return this.waitForWork(this.schedulerTick === undefined ? [] : [this.schedulerTick], deadline);
+  }
+
+  private async waitForActiveWork(deadline: number): Promise<boolean> {
+    return this.waitForWork([...this.active.keys()], deadline);
+  }
+
+  private async waitForWork(work: Promise<void>[], deadline: number): Promise<boolean> {
+    if (work.length === 0) return true;
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) return false;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, remainingMs);
+      void Promise.allSettled(work).then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    return work.every((task) => !this.active.has(task) && task !== this.schedulerTick);
+  }
+
+  private async endPool(deadline: number): Promise<void> {
+    const ending = this.pool.end().catch((error: unknown) => {
+      this.logger("warn", "worker.pool_end_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
+    });
+    await this.waitForWork([ending], deadline);
+  }
+
+  private tick(): Promise<void> {
+    if (this.stopping) {
+      return Promise.resolve();
     }
-    this.schedulerRunning = true;
+    if (this.schedulerTick) {
+      return this.schedulerTick;
+    }
+    const tick = this.runTick().finally(() => {
+      if (this.schedulerTick === tick) {
+        this.schedulerTick = undefined;
+      }
+    });
+    this.schedulerTick = tick;
+    return tick;
+  }
+
+  private async runTick(): Promise<void> {
     try {
       const slots = availableSlots(this.config.WORKER_CONCURRENCY, this.active.size);
       if (slots === 0) {
+        await writeSchedulerPass(this.pool, this.workerId);
         return;
       }
       const claims = await claimDueServices(this.pool, this.workerId, slots, this.config.WORKER_LEASE_SECONDS);
+      await writeSchedulerPass(this.pool, this.workerId);
       for (const claim of claims) {
         if (this.stopping) {
           break;
         }
         this.trackClaim(claim);
       }
-    } catch {
-      this.logger("error", "worker.scheduler_failed", { workerId: this.workerId });
-    } finally {
-      this.schedulerRunning = false;
+    } catch (error) {
+      this.logger("error", "worker.scheduler_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
     }
   }
 
@@ -123,17 +175,18 @@ export class WorkerRuntime {
   }
 
   private async runClaim(claim: ClaimedService, controller: AbortController): Promise<void> {
-    const startedAt = Date.now();
-    const probe = await probeHttp(claim.normalizedUrl, 10_000, {
+    const startedAt = performance.now();
+    const probe = await probeHttp(claim.normalizedUrl, PROBE_DEADLINE_MS, {
       ...this.probeDependencies,
       signal: controller.signal,
     });
-    if (controller.signal.aborted || this.stopping) {
+    // Continue persisting a completed probe during graceful shutdown. Only an
+    // explicit post-grace abort drops an unfinished request.
+    if (controller.signal.aborted) {
       return;
     }
     const result: CompletedProbe = probe.ok
       ? {
-          completedAt: new Date(),
           outcome: probe.httpStatus >= claim.acceptedStatusMin && probe.httpStatus <= claim.acceptedStatusMax ? "up" : "down",
           httpStatus: probe.httpStatus,
           responseTimeMs: probe.responseTimeMs,
@@ -141,7 +194,6 @@ export class WorkerRuntime {
           errorCode: probe.httpStatus >= claim.acceptedStatusMin && probe.httpStatus <= claim.acceptedStatusMax ? null : "HTTP_STATUS",
         }
       : {
-          completedAt: new Date(),
           outcome: "down",
           httpStatus: null,
           responseTimeMs: null,
@@ -157,15 +209,16 @@ export class WorkerRuntime {
         outcome: result.outcome,
         errorCode: result.errorCode ?? undefined,
         httpStatus: result.httpStatus ?? undefined,
-        durationMs: Date.now() - startedAt,
-        schedulingLagMs: Math.max(0, startedAt - claim.scheduledAt.getTime()),
-        persistence: persisted,
+        durationMs: Math.round(performance.now() - startedAt),
+        schedulingLagMs: persisted.schedulingLagMs,
+        persistence: persisted.status,
       });
-    } catch {
+    } catch (error) {
       this.logger("error", "worker.probe_persistence_failed", {
         workerId: this.workerId,
         serviceId: claim.id,
-        durationMs: Date.now() - startedAt,
+        durationMs: Math.round(performance.now() - startedAt),
+        errorCode: boundedErrorCode(error),
       });
     }
   }
@@ -174,8 +227,8 @@ export class WorkerRuntime {
     if (this.stopping) return;
     try {
       await writeHeartbeat(this.pool, this.workerId);
-    } catch {
-      this.logger("error", "worker.heartbeat_failed", { workerId: this.workerId });
+    } catch (error) {
+      this.logger("error", "worker.heartbeat_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
     }
   }
 
@@ -186,8 +239,8 @@ export class WorkerRuntime {
       if (counts) {
         this.logger("info", "worker.retention_completed", { workerId: this.workerId, ...counts });
       }
-    } catch {
-      this.logger("warn", "worker.retention_failed", { workerId: this.workerId });
+    } catch (error) {
+      this.logger("warn", "worker.retention_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
     }
   }
 }
@@ -205,8 +258,10 @@ async function main(): Promise<void> {
 }
 
 if (process.env.VITEST !== "true") {
-  void main().catch(() => {
-    console.error(JSON.stringify({ timestamp: new Date().toISOString(), level: "error", event: "worker.fatal" }));
+  void main().catch((error: unknown) => {
+    console.error(JSON.stringify({
+      timestamp: new Date().toISOString(), level: "error", event: "worker.fatal", errorCode: boundedErrorCode(error),
+    }));
     process.exitCode = 1;
   });
 }

@@ -37,7 +37,7 @@ export function errorResponse(error: unknown, requestId = createRequestId()): Ne
   const databaseCode = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
     ? error.code
     : undefined;
-  if (["08000", "08001", "08003", "08006", "57P01", "53300", "ECONNREFUSED", "ETIMEDOUT"].includes(databaseCode ?? "")) {
+  if (["08000", "08001", "08003", "08006", "55P03", "57014", "57P01", "53300", "ECONNREFUSED", "ETIMEDOUT"].includes(databaseCode ?? "")) {
     return json(
       { error: { code: "UNAVAILABLE", message: "A required dependency is unavailable.", requestId } },
       { status: 503 },
@@ -48,15 +48,30 @@ export function errorResponse(error: unknown, requestId = createRequestId()): Ne
 }
 
 export async function readJson(request: Request): Promise<unknown> {
+  const maximumBytes = 64 * 1024;
   const contentLength = request.headers.get("content-length");
-  if (contentLength !== null && Number(contentLength) > 64 * 1024) {
+  if (contentLength !== null && Number(contentLength) > maximumBytes) {
     throw new AppError({ code: "REQUEST_TOO_LARGE", message: "Request body is too large.", status: 413 });
   }
+  const reader = request.body?.getReader();
+  if (reader === undefined) {
+    throw new AppError({ code: "MALFORMED_JSON", message: "Request body must contain valid JSON.", status: 400 });
+  }
   try {
-    const text = await request.text();
-    if (new TextEncoder().encode(text).byteLength > 64 * 1024) {
-      throw new AppError({ code: "REQUEST_TOO_LARGE", message: "Request body is too large.", status: 413 });
+    const decoder = new TextDecoder();
+    let bytesRead = 0;
+    let text = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maximumBytes) {
+        await reader.cancel();
+        throw new AppError({ code: "REQUEST_TOO_LARGE", message: "Request body is too large.", status: 413 });
+      }
+      text += decoder.decode(value, { stream: true });
     }
+    text += decoder.decode();
     return JSON.parse(text) as unknown;
   } catch (error) {
     if (error instanceof AppError) throw error;

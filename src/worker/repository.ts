@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import type { Pool, PoolClient } from "pg";
 
 import { advanceSchedule } from "./schedule.js";
@@ -13,12 +14,17 @@ export interface ClaimedService {
 }
 
 export interface CompletedProbe {
-  completedAt: Date;
   outcome: "up" | "down";
   httpStatus: number | null;
   responseTimeMs: number | null;
   totalDurationMs: number;
   errorCode: "HTTP_STATUS" | "TIMEOUT" | "DNS_ERROR" | "TLS_ERROR" | "CONNECTION_ERROR" | "TARGET_BLOCKED" | "PROTOCOL_ERROR" | null;
+}
+
+export interface PersistedProbeResult {
+  status: "persisted" | "fenced" | "duplicate";
+  /** Measured using the same PostgreSQL clock as persistence. */
+  schedulingLagMs?: number;
 }
 
 interface ClaimedServiceRow {
@@ -86,7 +92,7 @@ export async function persistCompletedProbe(
   pool: Pool,
   claim: ClaimedService,
   result: CompletedProbe,
-): Promise<"persisted" | "fenced" | "duplicate"> {
+): Promise<PersistedProbeResult> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -99,9 +105,14 @@ export async function persistCompletedProbe(
     );
     if (lease.rowCount !== 1) {
       await client.query("ROLLBACK");
-      return "fenced";
+      return { status: "fenced" };
     }
 
+    // Use one database clock for completed_at, the hourly bucket, and schedule
+    // advancement. A worker host clock must not move an observation across a
+    // UTC bucket or cadence slot.
+    const clock = await client.query<{ completed_at: Date }>("SELECT clock_timestamp() AS completed_at");
+    const completedAt = clock.rows[0]!.completed_at;
     const inserted = await client.query(
       `INSERT INTO health_checks (
          service_id, lease_token, scheduled_at, started_at, completed_at,
@@ -113,8 +124,8 @@ export async function persistCompletedProbe(
         claim.id,
         claim.leaseToken,
         claim.scheduledAt,
-        new Date(result.completedAt.getTime() - result.totalDurationMs),
-        result.completedAt,
+        new Date(completedAt.getTime() - result.totalDurationMs),
+        completedAt,
         result.outcome,
         result.httpStatus,
         result.responseTimeMs,
@@ -126,11 +137,11 @@ export async function persistCompletedProbe(
     );
     if (inserted.rowCount !== 1) {
       await client.query("ROLLBACK");
-      return "duplicate";
+      return { status: "duplicate" };
     }
 
-    await updateHourlyAggregate(client, claim.id, result);
-    const nextCheckAt = advanceSchedule(claim.scheduledAt, claim.intervalSeconds, result.completedAt);
+    await updateHourlyAggregate(client, claim.id, result, completedAt);
+    const nextCheckAt = advanceSchedule(claim.scheduledAt, claim.intervalSeconds, completedAt);
     await client.query(
       `UPDATE services
        SET latest_scheduled_at = $3,
@@ -149,7 +160,7 @@ export async function persistCompletedProbe(
         claim.id,
         claim.leaseToken,
         claim.scheduledAt,
-        result.completedAt,
+        completedAt,
         result.outcome,
         result.httpStatus,
         result.responseTimeMs,
@@ -159,7 +170,10 @@ export async function persistCompletedProbe(
       ],
     );
     await client.query("COMMIT");
-    return "persisted";
+    return {
+      status: "persisted",
+      schedulingLagMs: Math.max(0, completedAt.getTime() - claim.scheduledAt.getTime()),
+    };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
     throw error;
@@ -168,7 +182,12 @@ export async function persistCompletedProbe(
   }
 }
 
-async function updateHourlyAggregate(client: PoolClient, serviceId: string, result: CompletedProbe): Promise<void> {
+async function updateHourlyAggregate(
+  client: PoolClient,
+  serviceId: string,
+  result: CompletedProbe,
+  completedAt: Date,
+): Promise<void> {
   const accepted = result.outcome === "up" ? 1 : 0;
   const hasResponseTime = result.responseTimeMs === null ? 0 : 1;
   await client.query(
@@ -196,7 +215,7 @@ async function updateHourlyAggregate(client: PoolClient, serviceId: string, resu
          END`,
     [
       serviceId,
-      result.completedAt,
+      completedAt,
       accepted,
       hasResponseTime,
       result.responseTimeMs ?? 0,
@@ -206,6 +225,16 @@ async function updateHourlyAggregate(client: PoolClient, serviceId: string, resu
 }
 
 export async function writeHeartbeat(pool: Pool, workerId: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO worker_heartbeats (worker_id, last_seen_at, scheduler_ran_at)
+     VALUES ($1, now(), now())
+     ON CONFLICT (worker_id) DO UPDATE
+     SET last_seen_at = now()`,
+    [workerId],
+  );
+}
+
+export async function writeSchedulerPass(pool: Pool, workerId: string): Promise<void> {
   await pool.query(
     `INSERT INTO worker_heartbeats (worker_id, last_seen_at, scheduler_ran_at)
      VALUES ($1, now(), now())
@@ -221,18 +250,21 @@ export interface CleanupCounts {
   heartbeats: number;
 }
 
-export async function runRetentionCleanup(pool: Pool, maxBatches = 10, batchSize = 1_000): Promise<CleanupCounts | null> {
+export async function runRetentionCleanup(pool: Pool, timeBudgetMs = 5_000, batchSize = 1_000): Promise<CleanupCounts | null> {
   const client = await pool.connect();
+  let releaseAsBroken = false;
+  let unlockError: unknown;
+  let cleanupError: unknown;
+  let cleanupCounts: CleanupCounts | null = null;
   try {
     const lock = await client.query<{ acquired: boolean }>(
       "SELECT pg_try_advisory_lock(735241901) AS acquired",
     );
-    if (!lock.rows[0]?.acquired) {
-      return null;
-    }
-    try {
+    if (lock.rows[0]?.acquired) {
+      try {
       let checks = 0;
-      for (let batch = 0; batch < maxBatches; batch += 1) {
+      const cleanupDeadline = performance.now() + timeBudgetMs;
+      for (;;) {
         const deleted = await client.query(
           `WITH expired AS (
              SELECT ctid FROM health_checks
@@ -247,21 +279,54 @@ export async function runRetentionCleanup(pool: Pool, maxBatches = 10, batchSize
         if ((deleted.rowCount ?? 0) < batchSize) {
           break;
         }
+        if (performance.now() >= cleanupDeadline) {
+          break;
+        }
       }
-      const hourly = await client.query(
-        `DELETE FROM health_check_hourly
-         WHERE hour_start + interval '1 hour' <= now() - interval '90 days'`,
-      );
+      let hourly = 0;
+      while (performance.now() < cleanupDeadline) {
+        const deleted = await client.query(
+          `WITH expired AS (
+             SELECT ctid FROM health_check_hourly
+             WHERE hour_start + interval '1 hour' <= now() - interval '90 days'
+             ORDER BY hour_start ASC
+             LIMIT $1
+           )
+           DELETE FROM health_check_hourly WHERE ctid IN (SELECT ctid FROM expired)`,
+          [batchSize],
+        );
+        hourly += deleted.rowCount ?? 0;
+        if ((deleted.rowCount ?? 0) < batchSize) {
+          break;
+        }
+      }
       const heartbeats = await client.query(
         `DELETE FROM worker_heartbeats WHERE last_seen_at < now() - interval '1 day'`,
       );
-      return { checks, hourly: hourly.rowCount ?? 0, heartbeats: heartbeats.rowCount ?? 0 };
-    } finally {
-      await client.query("SELECT pg_advisory_unlock(735241901)");
+      cleanupCounts = { checks, hourly, heartbeats: heartbeats.rowCount ?? 0 };
+      } catch (error) {
+        cleanupError = error;
+      }
+      try {
+        const unlocked = await client.query<{ unlocked: boolean }>("SELECT pg_advisory_unlock(735241901) AS unlocked");
+        if (!unlocked.rows[0]?.unlocked) {
+          throw new Error("Worker retention advisory lock was not held.");
+        }
+      } catch (error) {
+        releaseAsBroken = true;
+        unlockError = error;
+      }
     }
   } finally {
-    client.release();
+    client.release(releaseAsBroken ? new Error("Discarding client after advisory lock release failure.") : undefined);
   }
+  if (unlockError) {
+    throw unlockError;
+  }
+  if (cleanupError) {
+    throw cleanupError;
+  }
+  return cleanupCounts;
 }
 
 export async function releaseWorkerLeases(pool: Pool, owner: string): Promise<number> {
