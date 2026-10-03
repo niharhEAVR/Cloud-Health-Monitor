@@ -4,9 +4,9 @@ import type { ReactNode } from "react";
 import { bucketState, statusLabel } from "@/lib/monitor-format";
 import type { DisplayStatus, HistoryBucket } from "@/lib/monitor-types";
 
-type WorkerState = "online" | "delayed" | "unknown";
+export type WorkerState = "online" | "delayed" | "unknown";
 
-export function AppHeader({ workerState = "unknown" }: { workerState?: WorkerState }) {
+export function AppHeader({ workerState }: { workerState?: WorkerState | undefined }) {
   const label = workerState === "online" ? "Worker online" : workerState === "delayed" ? "Worker delayed" : "Worker status unavailable";
   return (
     <header className="topbar">
@@ -14,9 +14,7 @@ export function AppHeader({ workerState = "unknown" }: { workerState?: WorkerSta
         <span className="logo" aria-hidden="true"><i /><i /><i /></span>
         <span>Cloud Health Monitor</span>
       </Link>
-      <span className={`worker-state ${workerState}`}>
-        <i aria-hidden="true" />{label}
-      </span>
+      {workerState ? <span className={`worker-state ${workerState}`}><i aria-hidden="true" />{label}</span> : null}
     </header>
   );
 }

@@ -17,8 +17,12 @@ export function DeleteServiceDialog({ service, onClose, onDeleted, triggerRef }:
   const cancelRef = useRef<HTMLButtonElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const deletingRef = useRef(false);
+  const onCloseRef = useRef(onClose);
+  const onDeletedRef = useRef(onDeleted);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  onCloseRef.current = onClose;
+  onDeletedRef.current = onDeleted;
 
   useEffect(() => {
     returnFocusRef.current = triggerRef?.current ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
@@ -26,7 +30,7 @@ export function DeleteServiceDialog({ service, onClose, onDeleted, triggerRef }:
     const keepFocusInDialog = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        if (!deletingRef.current) onClose();
+        if (!deletingRef.current) onCloseRef.current();
         return;
       }
       if (event.key !== "Tab") return;
@@ -43,7 +47,7 @@ export function DeleteServiceDialog({ service, onClose, onDeleted, triggerRef }:
       const focusTarget = triggerRef?.current ?? returnFocusRef.current;
       focusTarget?.focus();
     };
-  }, [onClose]);
+  }, []);
 
   async function confirmDelete() {
     setDeleting(true);
@@ -51,7 +55,7 @@ export function DeleteServiceDialog({ service, onClose, onDeleted, triggerRef }:
     setError(null);
     try {
       await removeService(service.id);
-      onDeleted();
+      onDeletedRef.current();
     } catch (cause) {
       setError(cause instanceof MonitorApiError ? cause.message : "Unable to delete the service. Please try again.");
       setDeleting(false);
@@ -60,7 +64,7 @@ export function DeleteServiceDialog({ service, onClose, onDeleted, triggerRef }:
   }
 
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !deleting) onClose(); }}>
+    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !deleting) onCloseRef.current(); }}>
       <section className="dialog" ref={dialogRef} role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-description">
         <div className="dialog-icon" aria-hidden="true">!</div>
         <h2 id="delete-title">Delete this service?</h2>
@@ -69,7 +73,7 @@ export function DeleteServiceDialog({ service, onClose, onDeleted, triggerRef }:
         <p className="dialog-warning">This cannot be undone. Monitoring data cannot be restored.</p>
         {error ? <p className="field-error" role="alert">{error}</p> : null}
         <div className="dialog-actions">
-          <button className="button" ref={cancelRef} type="button" onClick={onClose} disabled={deleting}>Cancel</button>
+          <button className="button" ref={cancelRef} type="button" onClick={() => onCloseRef.current()} disabled={deleting}>Cancel</button>
           <button className="button danger" type="button" onClick={confirmDelete} disabled={deleting}>{deleting ? "Deleting…" : "Delete service"}</button>
         </div>
       </section>

@@ -8,6 +8,7 @@ const databaseUrl = process.env.API_TEST_DATABASE_URL;
 const describeWithDatabase = databaseUrl === undefined ? describe.skip : describe;
 const origin = "http://monitor.test";
 const runId = crypto.randomUUID();
+const fixtureServiceIds = new Set<string>();
 
 function testUrl(name: string): string {
   return `https://${name}-${runId}.example.test/health`;
@@ -42,7 +43,10 @@ describeWithDatabase("service API with PostgreSQL", () => {
   });
 
   afterAll(async () => {
-    const { closePool } = await import("@/server/db");
+    const { closePool, getPool } = await import("@/server/db");
+    if (fixtureServiceIds.size > 0) {
+      await getPool().query("DELETE FROM services WHERE id = ANY($1::uuid[])", [[...fixtureServiceIds]]);
+    }
     await closePool();
   });
 
@@ -60,6 +64,7 @@ describeWithDatabase("service API with PostgreSQL", () => {
     expect(created.headers.get("location")).toMatch(/^\/api\/services\//);
     expect(created.headers.get("cache-control")).toContain("no-store");
     const service = (await created.json()) as { id: string; status: string };
+    fixtureServiceIds.add(service.id);
     expect(service.status).toBe("pending");
 
     const replay = await POST(request());
@@ -109,10 +114,11 @@ describeWithDatabase("service API with PostgreSQL", () => {
   it("reports liveness and migrated database readiness without caching", async () => {
     const live = await import("@/app/api/health/live/route");
     const ready = await import("@/app/api/health/ready/route");
-    const liveResponse = live.GET(new Request(`${origin}/api/health/live`, { headers: { Host: "monitor.test" } }));
+    // Probe routes take no request dependency, so an orchestrator need not supply Host.
+    const liveResponse = live.GET();
     expect(liveResponse.status).toBe(200);
     expect(liveResponse.headers.get("cache-control")).toContain("no-store");
-    const readyResponse = await ready.GET(new Request(`${origin}/api/health/ready`, { headers: { Host: "monitor.test" } }));
+    const readyResponse = await ready.GET();
     expect(readyResponse.status).toBe(200);
     expect((await readyResponse.json()) as { status: string }).toEqual({ status: "ok" });
   });
@@ -122,6 +128,7 @@ describeWithDatabase("service API with PostgreSQL", () => {
     const history = await import("@/app/api/services/[id]/history/route");
     const created = await POST(mutation(`${origin}/api/services`, "POST", { name: "History", url: testUrl("history") }));
     const service = (await created.json()) as { id: string };
+    fixtureServiceIds.add(service.id);
     const { getPool } = await import("@/server/db");
     await getPool().query(
       `

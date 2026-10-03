@@ -63,7 +63,7 @@ cp .env.example .env
 
 All application values are validated at startup. In production, create distinct runtime and migration roles: the runtime role should have only the table permissions it needs, while the migration role owns schema changes. The example uses one local role only to make Compose convenient. Compose interpolates `.env` but injects `DATABASE_URL` only into web/worker, `MIGRATION_DATABASE_URL` only into the one-shot migration job, and the `POSTGRES_*` initialization values only into PostgreSQL.
 
-When deployed behind TLS termination, set `APP_ORIGIN` to the externally visible `https://` origin and configure the reverse proxy to enforce that host, HTTPS, body-size limits, and any request limiting/access policy. The bundled Compose port is intentionally bound to `127.0.0.1:3000`; publish it through a trusted local proxy rather than changing it to `0.0.0.0`.
+When deployed behind TLS termination, set `APP_ORIGIN` to the externally visible `https://` origin and configure the reverse proxy to enforce that host, HTTPS, body-size limits, and any request limiting/access policy. Data API routes validate the request `Host` against `APP_ORIGIN`, so the proxy **must forward the original public Host** rather than replacing it with `localhost` or the upstream container name (for example, Nginx: `proxy_set_header Host $host;`). The liveness and readiness endpoints are deliberately host-agnostic, so platform probes remain safe; the bundled Compose healthcheck still supplies the configured host for a deployment-consistent check. The bundled Compose port is intentionally bound to `127.0.0.1:3000`; publish it through a trusted local proxy rather than changing it to `0.0.0.0`.
 
 ## Run with Docker Compose
 

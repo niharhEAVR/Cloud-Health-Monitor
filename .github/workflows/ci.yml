@@ -56,6 +56,8 @@ jobs:
       - run: npm run typecheck
       - name: Run unit tests
         run: npm run test -- tests/unit
+      - name: Run component tests
+        run: npm run test -- tests/components
       - name: Run PostgreSQL API tests
         # This is a disposable CI-only database. Tests run only up migrations
         # and scoped test operations; the workflow never runs down migrations or DROP.

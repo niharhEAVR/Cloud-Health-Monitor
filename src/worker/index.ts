@@ -23,7 +23,7 @@ export class WorkerRuntime {
   private readonly active = new Map<Promise<void>, AbortController>();
   private readonly logger: WorkerLogger;
   private readonly pool: Pool;
-  private schedulerRunning = false;
+  private schedulerTick: Promise<void> | undefined;
   private stopping = false;
   private pollTimer: NodeJS.Timeout | undefined;
   private heartbeatTimer: NodeJS.Timeout | undefined;
@@ -70,16 +70,24 @@ export class WorkerRuntime {
     this.clearTimers();
     this.logger("info", "worker.stopping", { workerId: this.workerId, inFlight: this.active.size });
 
-    await this.waitForActiveWork(this.config.WORKER_SHUTDOWN_GRACE_MS);
+    const shutdownDeadline = performance.now() + this.config.WORKER_SHUTDOWN_GRACE_MS;
+    const schedulerSettled = await this.waitForSchedulerTick(shutdownDeadline);
+    await this.waitForActiveWork(shutdownDeadline);
     for (const controller of this.active.values()) {
       controller.abort();
     }
-    await Promise.allSettled([...this.active.keys()]);
+    await this.waitForActiveWork(shutdownDeadline);
     try {
-      const released = await releaseWorkerLeases(this.pool, this.workerId);
-      this.logger("info", "worker.leases_released", { workerId: this.workerId, released });
+      if (schedulerSettled) {
+        const released = await releaseWorkerLeases(this.pool, this.workerId);
+        this.logger("info", "worker.leases_released", { workerId: this.workerId, released });
+      } else {
+        // Do not race a late claim transaction. Its short lease will expire if
+        // the database remains unavailable beyond the graceful deadline.
+        this.logger("warn", "worker.lease_release_skipped", { workerId: this.workerId, reason: "scheduler_tick_timeout" });
+      }
     } finally {
-      await this.pool.end();
+      await this.endPool(shutdownDeadline);
     }
     this.logger("info", "worker.stopped", { workerId: this.workerId });
   }
@@ -93,23 +101,52 @@ export class WorkerRuntime {
     this.retentionTimer = undefined;
   }
 
-  private async waitForActiveWork(graceMs: number): Promise<void> {
-    const current = [...this.active.keys()];
-    if (current.length === 0) return;
+  private async waitForSchedulerTick(deadline: number): Promise<boolean> {
+    return this.waitForWork(this.schedulerTick === undefined ? [] : [this.schedulerTick], deadline);
+  }
+
+  private async waitForActiveWork(deadline: number): Promise<boolean> {
+    return this.waitForWork([...this.active.keys()], deadline);
+  }
+
+  private async waitForWork(work: Promise<void>[], deadline: number): Promise<boolean> {
+    if (work.length === 0) return true;
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) return false;
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, graceMs);
-      void Promise.allSettled(current).then(() => {
+      const timer = setTimeout(resolve, remainingMs);
+      void Promise.allSettled(work).then(() => {
         clearTimeout(timer);
         resolve();
       });
     });
+    return work.every((task) => !this.active.has(task) && task !== this.schedulerTick);
   }
 
-  private async tick(): Promise<void> {
-    if (this.stopping || this.schedulerRunning) {
-      return;
+  private async endPool(deadline: number): Promise<void> {
+    const ending = this.pool.end().catch((error: unknown) => {
+      this.logger("warn", "worker.pool_end_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
+    });
+    await this.waitForWork([ending], deadline);
+  }
+
+  private tick(): Promise<void> {
+    if (this.stopping) {
+      return Promise.resolve();
     }
-    this.schedulerRunning = true;
+    if (this.schedulerTick) {
+      return this.schedulerTick;
+    }
+    const tick = this.runTick().finally(() => {
+      if (this.schedulerTick === tick) {
+        this.schedulerTick = undefined;
+      }
+    });
+    this.schedulerTick = tick;
+    return tick;
+  }
+
+  private async runTick(): Promise<void> {
     try {
       const slots = availableSlots(this.config.WORKER_CONCURRENCY, this.active.size);
       if (slots === 0) {
@@ -126,8 +163,6 @@ export class WorkerRuntime {
       }
     } catch (error) {
       this.logger("error", "worker.scheduler_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
-    } finally {
-      this.schedulerRunning = false;
     }
   }
 
@@ -175,7 +210,8 @@ export class WorkerRuntime {
         errorCode: result.errorCode ?? undefined,
         httpStatus: result.httpStatus ?? undefined,
         durationMs: Math.round(performance.now() - startedAt),
-        persistence: persisted,
+        schedulingLagMs: persisted.schedulingLagMs,
+        persistence: persisted.status,
       });
     } catch (error) {
       this.logger("error", "worker.probe_persistence_failed", {

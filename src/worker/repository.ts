@@ -21,6 +21,12 @@ export interface CompletedProbe {
   errorCode: "HTTP_STATUS" | "TIMEOUT" | "DNS_ERROR" | "TLS_ERROR" | "CONNECTION_ERROR" | "TARGET_BLOCKED" | "PROTOCOL_ERROR" | null;
 }
 
+export interface PersistedProbeResult {
+  status: "persisted" | "fenced" | "duplicate";
+  /** Measured using the same PostgreSQL clock as persistence. */
+  schedulingLagMs?: number;
+}
+
 interface ClaimedServiceRow {
   id: string;
   normalized_url: string;
@@ -86,7 +92,7 @@ export async function persistCompletedProbe(
   pool: Pool,
   claim: ClaimedService,
   result: CompletedProbe,
-): Promise<"persisted" | "fenced" | "duplicate"> {
+): Promise<PersistedProbeResult> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -99,7 +105,7 @@ export async function persistCompletedProbe(
     );
     if (lease.rowCount !== 1) {
       await client.query("ROLLBACK");
-      return "fenced";
+      return { status: "fenced" };
     }
 
     // Use one database clock for completed_at, the hourly bucket, and schedule
@@ -131,7 +137,7 @@ export async function persistCompletedProbe(
     );
     if (inserted.rowCount !== 1) {
       await client.query("ROLLBACK");
-      return "duplicate";
+      return { status: "duplicate" };
     }
 
     await updateHourlyAggregate(client, claim.id, result, completedAt);
@@ -164,7 +170,10 @@ export async function persistCompletedProbe(
       ],
     );
     await client.query("COMMIT");
-    return "persisted";
+    return {
+      status: "persisted",
+      schedulingLagMs: Math.max(0, completedAt.getTime() - claim.scheduledAt.getTime()),
+    };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
     throw error;

@@ -63,7 +63,7 @@ describe("worker repository coordination", () => {
     );
 
     const calls = pool.client.query.mock.calls as unknown as Array<[string]>;
-    expect(status).toBe("fenced");
+    expect(status).toEqual({ status: "fenced" });
     expect(calls).toHaveLength(3);
     expect(String(calls[2]?.[0])).toBe("ROLLBACK");
   });
@@ -90,7 +90,7 @@ describe("worker repository coordination", () => {
     };
     await expect(persistCompletedProbe(pool as never, claim, {
       outcome: "up", httpStatus: 204, responseTimeMs: 10, totalDurationMs: 10, errorCode: null,
-    })).resolves.toBe("persisted");
+    })).resolves.toEqual({ status: "persisted", schedulingLagMs: 120_000 });
 
     const calls = pool.client.query.mock.calls as unknown as Array<[string, unknown[]?]>;
     expect(calls[2]?.[0]).toContain("clock_timestamp");

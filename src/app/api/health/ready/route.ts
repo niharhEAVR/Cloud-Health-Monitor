@@ -1,18 +1,15 @@
 import { getPool, queryOne } from "@/server/db";
 import { AppError, createRequestId } from "@/server/errors";
-import { hasAllowedApiHost } from "@/server/security";
 
 import { errorResponse, json } from "../../_lib/route";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET(request: Request) {
+/** Deliberately host-agnostic so platform readiness probes can reach this process. */
+export async function GET() {
   const requestId = createRequestId();
   try {
-    if (!hasAllowedApiHost(request)) {
-      throw new AppError({ code: "ORIGIN_FORBIDDEN", message: "API host is not allowed.", status: 403 });
-    }
     const row = await queryOne<{ schema_ready: boolean }>(
       getPool(),
       `

@@ -40,12 +40,11 @@ COPY --from=build --chown=monitor:monitor /app/dist/worker ./dist/worker
 USER monitor
 CMD ["node", "dist/worker/index.js"]
 
-# The migration target installs only its pinned CLI. Unlike the build stage it
-# does not carry TypeScript, Next.js tooling, source, or test dependencies.
+# The migration target uses the repository lockfile's production dependency
+# closure. It has no global install, source, tests, or development tooling.
 FROM runtime-base AS migrate
-RUN npm install --global --omit=dev --ignore-scripts node-pg-migrate@8.0.4 \
-  && npm cache clean --force
+COPY --from=production-dependencies --chown=monitor:monitor /app/node_modules ./node_modules
 COPY --chown=monitor:monitor package.json ./package.json
 COPY --chown=monitor:monitor db/migrations ./db/migrations
 USER monitor
-CMD ["node-pg-migrate", "up", "--migrations-dir", "db/migrations", "--database-url-var", "MIGRATION_DATABASE_URL"]
+CMD ["node", "node_modules/node-pg-migrate/bin/node-pg-migrate.js", "up", "--migrations-dir", "db/migrations", "--database-url-var", "MIGRATION_DATABASE_URL"]

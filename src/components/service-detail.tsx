@@ -5,11 +5,22 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { DeleteServiceDialog } from "@/components/delete-service-dialog";
 import { AppHeader, Notice, StatusBadge } from "@/components/monitor-ui";
-import { getHistory, getService, MonitorApiError } from "@/lib/monitor-api";
+import type { WorkerState } from "@/components/monitor-ui";
+import { getDashboard, getHistory, getService, MonitorApiError } from "@/lib/monitor-api";
 import { checkResult, formatAvailability, formatDuration, formatRelativeTime } from "@/lib/monitor-format";
 import type { HistoryRange, ServiceHistory, ServiceSummary } from "@/lib/monitor-types";
 
 const ranges: HistoryRange[] = ["24h", "7d", "30d", "90d"];
+
+function checkKey(check: ServiceHistory["checks"][number]): string {
+  return check.id || `${check.completedAt}-${check.outcome}-${check.httpStatus ?? "transport"}`;
+}
+
+function mergeChecks(current: ServiceHistory["checks"], incoming: ServiceHistory["checks"]): ServiceHistory["checks"] {
+  const checks = new Map<string, ServiceHistory["checks"][number]>();
+  for (const check of [...incoming, ...current]) checks.set(checkKey(check), check);
+  return [...checks.values()].sort((left, right) => new Date(right.completedAt).getTime() - new Date(left.completedAt).getTime());
+}
 
 function HistoryChart({ history }: { history: ServiceHistory }) {
   const values = history.buckets.map((bucket) => bucket.averageResponseTimeMs).filter((value): value is number => value !== null);
@@ -28,12 +39,16 @@ export function ServiceDetail({ id }: { id: string }) {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [moreLoading, setMoreLoading] = useState(false);
   const [moreError, setMoreError] = useState<string | null>(null);
+  const [workerState, setWorkerState] = useState<WorkerState | undefined>();
   const deleteTriggerRef = useRef<HTMLButtonElement>(null);
 
   const load = useCallback(async (initial = false) => {
     try {
-      const [nextService, nextHistory] = await Promise.all([getService(id), getHistory(id, range)]);
-      setService(nextService); setHistory(nextHistory); setError(null); setNotFound(false);
+      const [nextService, nextHistory, dashboard] = await Promise.all([getService(id), getHistory(id, range), getDashboard().catch(() => null)]);
+      setService(nextService);
+      setHistory((current) => current?.range === nextHistory.range ? { ...nextHistory, checks: mergeChecks(current.checks, nextHistory.checks) } : nextHistory);
+      setWorkerState(dashboard === null ? undefined : dashboard.workerLastHeartbeatAt === null ? "unknown" : dashboard.workerDelayed ? "delayed" : "online");
+      setError(null); setNotFound(false);
     } catch (cause) {
       const apiError = cause instanceof MonitorApiError ? cause : null;
       if (apiError?.status === 404) { setNotFound(true); setError(null); return; }
@@ -55,18 +70,18 @@ export function ServiceDetail({ id }: { id: string }) {
     setMoreLoading(true); setMoreError(null);
     try {
       const page = await getHistory(id, range, history.nextCursor);
-      setHistory((current) => current ? { ...page, checks: [...current.checks, ...page.checks] } : page);
+      setHistory((current) => current?.range === page.range ? { ...page, checks: mergeChecks(current.checks, page.checks) } : page);
     } catch (cause) {
       setMoreError(cause instanceof MonitorApiError ? cause.message : "Unable to load more checks. Please try again.");
     } finally { setMoreLoading(false); }
   }
 
-  if (notFound) return <><AppHeader /><main className="page" id="main-content"><section className="panel empty-state"><h1>Service not found</h1><p>This service may have been deleted. Return to the dashboard to see the monitored services that remain.</p><Link className="button primary" href="/">Back to dashboard</Link></section></main></>;
+  if (notFound) return <><AppHeader workerState={workerState} /><main className="page" id="main-content"><section className="panel empty-state"><h1>Service not found</h1><p>This service may have been deleted. Return to the dashboard to see the monitored services that remain.</p><Link className="button primary" href="/">Back to dashboard</Link></section></main></>;
   if (error && !service) return <><AppHeader /><main className="page" id="main-content"><section className="panel empty-state" role="alert"><h1>Service unavailable</h1><p>{error}</p><button className="button primary" type="button" onClick={() => void load(true)}>Try again</button><Link className="button" href="/">Back to dashboard</Link></section></main></>;
   if (!service || !history) return <><AppHeader /><main className="page loading" id="main-content" aria-label="Loading service"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></main></>;
 
   const latest = service.latestCheck;
-  return <><AppHeader /><main className="page" id="main-content"><Link className="back-link" href="/">← Back to dashboard</Link><div className="title-row"><div><div className="eyebrow">Service</div><h1>{service.name}</h1><p className="service-url">{service.url}</p></div><div className="dashboard-actions"><StatusBadge status={service.status} /><button className="button danger" ref={deleteTriggerRef} type="button" onClick={() => setDeleteOpen(true)}>Delete service</button></div></div>
+  return <><AppHeader workerState={workerState} /><main className="page" id="main-content"><Link className="back-link" href="/">← Back to dashboard</Link><div className="title-row"><div><div className="eyebrow">Service</div><h1>{service.name}</h1><p className="service-url">{service.url}</p></div><div className="dashboard-actions"><StatusBadge status={service.status} /><button className="button danger" ref={deleteTriggerRef} type="button" onClick={() => setDeleteOpen(true)}>Delete service</button></div></div>
     {service.status === "stale" ? <Notice kind="warning">The last observation is stale. The last known result is still shown below.</Notice> : null}{error ? <Notice kind="error">Refresh failed: {error} Showing the last successful result.</Notice> : null}
     <div className="detail-grid"><div className="detail-main"><section className="panel"><div className="panel-heading"><h2>Current result</h2><StatusBadge status={service.status} /></div><div className="metrics"><div className="metric"><span className="small muted">Latest result</span><strong>{checkResult(latest)}</strong></div><div className="metric"><span className="small muted">Response time</span><strong>{formatDuration(latest?.responseTimeMs ?? null)}</strong></div><div className="metric"><span className="small muted">Last completed</span><strong>{formatRelativeTime(latest?.completedAt ?? null)}</strong></div></div></section>
       <section className="panel"><div className="panel-heading"><div><h2>Response time</h2><p className="small muted">{range === "24h" ? "Hourly" : "Time-bucketed"} averages · {range}</p></div><div className="range-tabs" aria-label="History range">{ranges.map((item) => <button key={item} type="button" aria-pressed={range === item} onClick={() => setRange(item)}>{item}</button>)}</div></div><HistoryChart history={history} /></section>
