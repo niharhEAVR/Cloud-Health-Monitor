@@ -1,0 +1,19 @@
+.git
+.github
+.next
+node_modules
+coverage
+playwright-report
+test-results
+tests
+
+# Never send local runtime configuration or credentials to the image build.
+.env
+.env.*
+*.log
+*.tsbuildinfo
+
+# Local editor and operating-system files.
+.DS_Store
+.idea
+.vscode
