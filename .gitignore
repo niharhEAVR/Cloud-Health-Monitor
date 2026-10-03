@@ -1,0 +1,21 @@
+# dependencies and build output
+node_modules/
+.next/
+out/
+dist/
+coverage/
+playwright-report/
+test-results/
+
+# environment and local data
+.env
+.env.local
+.env.*.local
+*.log
+
+# editor and operating system files
+.DS_Store
+.vscode/
+.idea/
+
+*.tsbuildinfo

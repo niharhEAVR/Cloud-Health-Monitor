@@ -1,0 +1,49 @@
+{
+  "name": "cloud-health-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "dev": "next dev --hostname 0.0.0.0",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:worker": "tsup src/worker/index.ts --format esm --target node24 --out-dir dist/worker --clean",
+    "worker": "node dist/worker/index.js",
+    "worker:dev": "tsx src/worker/index.ts",
+    "migrate": "node-pg-migrate up --migrations-dir db/migrations --database-url-var MIGRATION_DATABASE_URL",
+    "migrate:down": "node-pg-migrate down --migrations-dir db/migrations --database-url-var MIGRATION_DATABASE_URL"
+  },
+  "dependencies": {
+    "next": "16.3.8",
+    "pg": "8.23.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "server-only": "0.0.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "@playwright/test": "1.58.2",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.1",
+    "@types/node": "24.10.1",
+    "@types/pg": "8.15.6",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "eslint": "9.39.1",
+    "globals": "16.5.0",
+    "node-pg-migrate": "8.0.4",
+    "tsup": "8.5.1",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.46.1",
+    "vitest": "5.0.3"
+  },
+  "type": "module"
+}

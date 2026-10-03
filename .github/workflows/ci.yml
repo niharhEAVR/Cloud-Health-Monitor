@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 24.12.0
+  APP_ORIGIN: http://monitor.test
+  DATABASE_URL: postgresql://cloud_health:cloud_health@127.0.0.1:5432/cloud_health
+  MIGRATION_DATABASE_URL: postgresql://cloud_health:cloud_health@127.0.0.1:5432/cloud_health
+  API_TEST_DATABASE_URL: postgresql://cloud_health:cloud_health@127.0.0.1:5432/cloud_health
+  LOG_LEVEL: warn
+  DATABASE_POOL_MAX: "5"
+  DATABASE_CONNECTION_TIMEOUT_MS: "5000"
+  DATABASE_STATEMENT_TIMEOUT_MS: "10000"
+  WORKER_CONCURRENCY: "2"
+  MAX_SERVICES: "100"
+
+jobs:
+  verify:
+    name: Lint, typecheck, and PostgreSQL tests
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_DB: cloud_health
+          POSTGRES_USER: cloud_health
+          POSTGRES_PASSWORD: cloud_health
+        options: >-
+          --health-cmd "pg_isready -U cloud_health -d cloud_health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Run unit, API, and worker tests
+        run: npm run test
+      - name: Build production artifacts
+        run: npm run build && npm run build:worker
+
+  docker-build:
+    name: Build container targets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build web target
+        run: docker build --target web --tag cloud-health-monitor:web-ci .
+      - name: Build worker target
+        run: docker build --target worker --tag cloud-health-monitor:worker-ci .
+      - name: Build migration target
+        run: docker build --target migrate --tag cloud-health-monitor:migrate-ci .
+
+  compose-browser-smoke:
+    name: Compose and browser smoke
+    needs: docker-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Create isolated Compose environment
+        run: |
+          cat > .env <<'EOF'
+          APP_ORIGIN=http://127.0.0.1:3000
+          DATABASE_URL=postgresql://cloud_health:ci-password@db:5432/cloud_health
+          MIGRATION_DATABASE_URL=postgresql://cloud_health:ci-password@db:5432/cloud_health
+          POSTGRES_DB=cloud_health
+          POSTGRES_USER=cloud_health
+          POSTGRES_PASSWORD=ci-password
+          LOG_LEVEL=warn
+          DATABASE_POOL_MAX=5
+          DATABASE_CONNECTION_TIMEOUT_MS=5000
+          DATABASE_STATEMENT_TIMEOUT_MS=10000
+          WORKER_CONCURRENCY=2
+          WORKER_LEASE_SECONDS=45
+          WORKER_POLL_INTERVAL_MS=1000
+          WORKER_SHUTDOWN_GRACE_MS=25000
+          MAX_SERVICES=100
+          EOF
+      - name: Start local-only Compose stack
+        run: docker compose up --build --wait --wait-timeout 180
+      - name: Check liveness and readiness
+        run: |
+          curl --fail --retry 10 --retry-connrefused http://127.0.0.1:3000/api/health/live
+          curl --fail --retry 10 --retry-connrefused http://127.0.0.1:3000/api/health/ready
+      - name: Install Chromium for focused local smoke
+        run: npx playwright install --with-deps chromium
+      - name: Open the local dashboard in Chromium
+        run: |
+          mkdir -p .ci-smoke
+          cat > .ci-smoke/compose-smoke.spec.ts <<'EOF'
+          import { expect, test } from "@playwright/test";
+
+          test("the Compose dashboard renders locally", async ({ page }) => {
+            const response = await page.goto("http://127.0.0.1:3000", { waitUntil: "domcontentloaded" });
+            expect(response?.ok()).toBe(true);
+            await expect(page.locator("body")).not.toBeEmpty();
+          });
+          EOF
+          npx playwright test .ci-smoke/compose-smoke.spec.ts
+      - name: Print Compose logs after a failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop and remove the smoke stack
+        if: always()
+        run: docker compose down -v --remove-orphans
