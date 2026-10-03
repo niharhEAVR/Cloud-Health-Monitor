@@ -43,7 +43,7 @@ export const up = (pgm) => {
   pgm.addConstraint(
     "services",
     "services_latest_snapshot_consistency",
-    "CHECK ((latest_completed_at IS NULL AND latest_scheduled_at IS NULL AND latest_outcome IS NULL AND latest_http_status IS NULL AND latest_response_time_ms IS NULL AND latest_duration_ms IS NULL AND latest_error_code IS NULL) OR (latest_completed_at IS NOT NULL AND latest_scheduled_at IS NOT NULL AND latest_scheduled_at <= latest_completed_at AND latest_duration_ms >= 0 AND ((latest_outcome = 'up' AND latest_http_status BETWEEN accepted_status_min AND accepted_status_max AND latest_response_time_ms BETWEEN 0 AND latest_duration_ms AND latest_error_code IS NULL) OR (latest_outcome = 'down' AND ((latest_http_status BETWEEN 100 AND 599 AND latest_response_time_ms BETWEEN 0 AND latest_duration_ms AND latest_error_code = 'HTTP_STATUS') OR (latest_http_status IS NULL AND latest_response_time_ms IS NULL AND latest_error_code IN ('TIMEOUT', 'DNS_ERROR', 'TLS_ERROR', 'CONNECTION_ERROR', 'TARGET_BLOCKED', 'PROTOCOL_ERROR'))))))",
+    "CHECK ((latest_completed_at IS NULL AND latest_scheduled_at IS NULL AND latest_outcome IS NULL AND latest_http_status IS NULL AND latest_response_time_ms IS NULL AND latest_duration_ms IS NULL AND latest_error_code IS NULL) OR (latest_completed_at IS NOT NULL AND latest_scheduled_at IS NOT NULL AND latest_scheduled_at <= latest_completed_at AND latest_duration_ms >= 0 AND ((latest_outcome = 'up' AND latest_http_status BETWEEN accepted_status_min AND accepted_status_max AND latest_response_time_ms BETWEEN 0 AND latest_duration_ms AND latest_error_code IS NULL) OR (latest_outcome = 'down' AND ((latest_http_status BETWEEN 100 AND 599 AND latest_response_time_ms BETWEEN 0 AND latest_duration_ms AND latest_error_code = 'HTTP_STATUS') OR (latest_http_status IS NULL AND latest_response_time_ms IS NULL AND latest_error_code IN ('TIMEOUT', 'DNS_ERROR', 'TLS_ERROR', 'CONNECTION_ERROR', 'TARGET_BLOCKED', 'PROTOCOL_ERROR')))))))",
   );
 
   pgm.createTable("health_checks", {
@@ -79,7 +79,8 @@ export const up = (pgm) => {
     response_time_sum_ms: { type: "bigint", notNull: true, default: 0 },
     response_time_min_ms: { type: "integer" },
     response_time_max_ms: { type: "integer" },
-    primaryKey: ["service_id", "hour_start"],
+  }, {
+    constraints: { primaryKey: ["service_id", "hour_start"] },
   });
   pgm.addConstraint("health_check_hourly", "health_check_hourly_utc_hour", "CHECK (hour_start = date_trunc('hour', hour_start AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')");
   pgm.addConstraint("health_check_hourly", "health_check_hourly_counts", "CHECK (completed_checks >= 0 AND accepted_checks BETWEEN 0 AND completed_checks AND response_time_count BETWEEN 0 AND completed_checks AND response_time_sum_ms >= 0)");
