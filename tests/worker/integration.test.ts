@@ -2,14 +2,15 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 
 import { Pool } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { claimDueServices, persistCompletedProbe } from "@/worker/repository";
 
 const execFile = promisify(execFileCallback);
-const databaseUrl = process.env.WORKER_TEST_DATABASE_URL ?? process.env.API_TEST_DATABASE_URL;
+const databaseUrl = process.env.WORKER_TEST_DATABASE_URL;
 const describeWithDatabase = databaseUrl === undefined ? describe.skip : describe;
 let pool: Pool;
+const runId = crypto.randomUUID();
 
 async function migrate(): Promise<void> {
   await execFile(
@@ -25,10 +26,6 @@ describeWithDatabase("worker PostgreSQL coordination", () => {
     pool = new Pool({ connectionString: databaseUrl });
   });
 
-  beforeEach(async () => {
-    await pool.query("TRUNCATE services CASCADE");
-  });
-
   afterAll(async () => {
     await pool.end();
   });
@@ -36,8 +33,9 @@ describeWithDatabase("worker PostgreSQL coordination", () => {
   it("claims separate due rows concurrently and persists one fenced result atomically", async () => {
     await pool.query(
       `INSERT INTO services (name, normalized_url, interval_seconds, next_check_at)
-       VALUES ('One', 'https://one.example.test/health', 60, now() - interval '1 minute'),
-              ('Two', 'https://two.example.test/health', 60, now() - interval '1 minute')`,
+       VALUES ($1, $2, 60, now() - interval '1 minute'),
+              ($3, $4, 60, now() - interval '1 minute')`,
+      [`One ${runId}`, `https://one-${runId}.example.test/health`, `Two ${runId}`, `https://two-${runId}.example.test/health`],
     );
     const ownerOne = "00000000-0000-4000-8000-000000000010";
     const ownerTwo = "00000000-0000-4000-8000-000000000011";
@@ -52,7 +50,6 @@ describeWithDatabase("worker PostgreSQL coordination", () => {
 
     const claim = first[0]!;
     const status = await persistCompletedProbe(pool, claim, {
-      completedAt: new Date(),
       outcome: "up",
       httpStatus: 204,
       responseTimeMs: 12,
@@ -71,7 +68,6 @@ describeWithDatabase("worker PostgreSQL coordination", () => {
     expect(stored.rows[0]).toEqual({ check_count: "1", bucket_count: "1", lease_token: null });
 
     expect(await persistCompletedProbe(pool, claim, {
-      completedAt: new Date(),
       outcome: "up",
       httpStatus: 204,
       responseTimeMs: 12,

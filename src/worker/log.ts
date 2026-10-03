@@ -36,3 +36,15 @@ export function createLogger(config: Pick<WorkerEnv, "LOG_LEVEL">) {
 }
 
 export type WorkerLogger = ReturnType<typeof createLogger>;
+
+/** Never log exception messages: drivers can include URLs, credentials, or SQL. */
+export function boundedErrorCode(error: unknown): string {
+  const candidate = typeof error === "object" && error !== null
+    ? "code" in error && typeof error.code === "string"
+      ? error.code
+      : "name" in error && typeof error.name === "string"
+        ? error.name
+        : "UNKNOWN_ERROR"
+    : "UNKNOWN_ERROR";
+  return candidate.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 64) || "UNKNOWN_ERROR";
+}

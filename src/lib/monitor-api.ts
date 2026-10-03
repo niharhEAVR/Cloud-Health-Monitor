@@ -8,10 +8,12 @@ import type {
 
 export class MonitorApiError extends Error {
   fieldErrors: Record<string, string[]> | undefined;
+  status: number;
 
-  constructor(message: string, fieldErrors?: Record<string, string[]>) {
+  constructor(message: string, status: number, fieldErrors?: Record<string, string[]>) {
     super(message);
     this.name = "MonitorApiError";
+    this.status = status;
     this.fieldErrors = fieldErrors;
   }
 }
@@ -82,6 +84,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     const error = objectValue(objectValue(body).error);
     throw new MonitorApiError(
       stringValue(error.message, "The request could not be completed. Please try again."),
+      response.status,
       error.fieldErrors as Record<string, string[]> | undefined,
     );
   }
@@ -126,8 +129,7 @@ export async function getHistory(id: string, range: string, cursor?: string): Pr
   };
 }
 
-export async function createService(input: Record<string, unknown>): Promise<ServiceSummary> {
-  const idempotencyKey = crypto.randomUUID();
+export async function createService(input: Record<string, unknown>, idempotencyKey = crypto.randomUUID()): Promise<ServiceSummary> {
   return asService(
     await request<unknown>("/api/services", {
       method: "POST",

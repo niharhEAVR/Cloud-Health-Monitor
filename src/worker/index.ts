@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import { Pool } from "pg";
 
-import { parseWorkerEnv, type WorkerEnv } from "./config.js";
-import { createLogger, redactTargetUrl, type WorkerLogger } from "./log.js";
+import { parseWorkerEnv, PROBE_DEADLINE_MS, type WorkerEnv } from "./config.js";
+import { boundedErrorCode, createLogger, redactTargetUrl, type WorkerLogger } from "./log.js";
 import { probeHttp, type ProbeDependencies } from "./probe.js";
 import {
   claimDueServices,
@@ -11,6 +12,7 @@ import {
   releaseWorkerLeases,
   runRetentionCleanup,
   writeHeartbeat,
+  writeSchedulerPass,
   type ClaimedService,
   type CompletedProbe,
 } from "./repository.js";
@@ -40,7 +42,9 @@ export class WorkerRuntime {
     });
     this.logger = options.logger ?? createLogger(config);
     this.probeDependencies = options.probeDependencies;
-    this.pool.on("error", () => this.logger("error", "worker.database.idle_client_error"));
+    this.pool.on("error", (error) => this.logger("error", "worker.database.idle_client_error", {
+      errorCode: boundedErrorCode(error),
+    }));
   }
 
   private readonly probeDependencies: ProbeDependencies | undefined;
@@ -48,8 +52,11 @@ export class WorkerRuntime {
   async start(): Promise<void> {
     this.logger("info", "worker.started", { workerId: this.workerId, concurrency: this.config.WORKER_CONCURRENCY });
     await this.heartbeat();
+    if (this.stopping) return;
     await this.cleanup();
+    if (this.stopping) return;
     await this.tick();
+    if (this.stopping) return;
     this.pollTimer = setInterval(() => void this.tick(), this.config.WORKER_POLL_INTERVAL_MS);
     this.heartbeatTimer = setInterval(() => void this.heartbeat(), 10_000);
     this.retentionTimer = setInterval(() => void this.cleanup(), 60 * 60 * 1_000);
@@ -63,11 +70,7 @@ export class WorkerRuntime {
     this.clearTimers();
     this.logger("info", "worker.stopping", { workerId: this.workerId, inFlight: this.active.size });
 
-    const current = [...this.active.keys()];
-    await Promise.race([
-      Promise.allSettled(current),
-      new Promise<void>((resolve) => setTimeout(resolve, this.config.WORKER_SHUTDOWN_GRACE_MS)),
-    ]);
+    await this.waitForActiveWork(this.config.WORKER_SHUTDOWN_GRACE_MS);
     for (const controller of this.active.values()) {
       controller.abort();
     }
@@ -90,6 +93,18 @@ export class WorkerRuntime {
     this.retentionTimer = undefined;
   }
 
+  private async waitForActiveWork(graceMs: number): Promise<void> {
+    const current = [...this.active.keys()];
+    if (current.length === 0) return;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, graceMs);
+      void Promise.allSettled(current).then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
   private async tick(): Promise<void> {
     if (this.stopping || this.schedulerRunning) {
       return;
@@ -98,17 +113,19 @@ export class WorkerRuntime {
     try {
       const slots = availableSlots(this.config.WORKER_CONCURRENCY, this.active.size);
       if (slots === 0) {
+        await writeSchedulerPass(this.pool, this.workerId);
         return;
       }
       const claims = await claimDueServices(this.pool, this.workerId, slots, this.config.WORKER_LEASE_SECONDS);
+      await writeSchedulerPass(this.pool, this.workerId);
       for (const claim of claims) {
         if (this.stopping) {
           break;
         }
         this.trackClaim(claim);
       }
-    } catch {
-      this.logger("error", "worker.scheduler_failed", { workerId: this.workerId });
+    } catch (error) {
+      this.logger("error", "worker.scheduler_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
     } finally {
       this.schedulerRunning = false;
     }
@@ -123,17 +140,18 @@ export class WorkerRuntime {
   }
 
   private async runClaim(claim: ClaimedService, controller: AbortController): Promise<void> {
-    const startedAt = Date.now();
-    const probe = await probeHttp(claim.normalizedUrl, 10_000, {
+    const startedAt = performance.now();
+    const probe = await probeHttp(claim.normalizedUrl, PROBE_DEADLINE_MS, {
       ...this.probeDependencies,
       signal: controller.signal,
     });
-    if (controller.signal.aborted || this.stopping) {
+    // Continue persisting a completed probe during graceful shutdown. Only an
+    // explicit post-grace abort drops an unfinished request.
+    if (controller.signal.aborted) {
       return;
     }
     const result: CompletedProbe = probe.ok
       ? {
-          completedAt: new Date(),
           outcome: probe.httpStatus >= claim.acceptedStatusMin && probe.httpStatus <= claim.acceptedStatusMax ? "up" : "down",
           httpStatus: probe.httpStatus,
           responseTimeMs: probe.responseTimeMs,
@@ -141,7 +159,6 @@ export class WorkerRuntime {
           errorCode: probe.httpStatus >= claim.acceptedStatusMin && probe.httpStatus <= claim.acceptedStatusMax ? null : "HTTP_STATUS",
         }
       : {
-          completedAt: new Date(),
           outcome: "down",
           httpStatus: null,
           responseTimeMs: null,
@@ -157,15 +174,15 @@ export class WorkerRuntime {
         outcome: result.outcome,
         errorCode: result.errorCode ?? undefined,
         httpStatus: result.httpStatus ?? undefined,
-        durationMs: Date.now() - startedAt,
-        schedulingLagMs: Math.max(0, startedAt - claim.scheduledAt.getTime()),
+        durationMs: Math.round(performance.now() - startedAt),
         persistence: persisted,
       });
-    } catch {
+    } catch (error) {
       this.logger("error", "worker.probe_persistence_failed", {
         workerId: this.workerId,
         serviceId: claim.id,
-        durationMs: Date.now() - startedAt,
+        durationMs: Math.round(performance.now() - startedAt),
+        errorCode: boundedErrorCode(error),
       });
     }
   }
@@ -174,8 +191,8 @@ export class WorkerRuntime {
     if (this.stopping) return;
     try {
       await writeHeartbeat(this.pool, this.workerId);
-    } catch {
-      this.logger("error", "worker.heartbeat_failed", { workerId: this.workerId });
+    } catch (error) {
+      this.logger("error", "worker.heartbeat_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
     }
   }
 
@@ -186,8 +203,8 @@ export class WorkerRuntime {
       if (counts) {
         this.logger("info", "worker.retention_completed", { workerId: this.workerId, ...counts });
       }
-    } catch {
-      this.logger("warn", "worker.retention_failed", { workerId: this.workerId });
+    } catch (error) {
+      this.logger("warn", "worker.retention_failed", { workerId: this.workerId, errorCode: boundedErrorCode(error) });
     }
   }
 }
@@ -205,8 +222,10 @@ async function main(): Promise<void> {
 }
 
 if (process.env.VITEST !== "true") {
-  void main().catch(() => {
-    console.error(JSON.stringify({ timestamp: new Date().toISOString(), level: "error", event: "worker.fatal" }));
+  void main().catch((error: unknown) => {
+    console.error(JSON.stringify({
+      timestamp: new Date().toISOString(), level: "error", event: "worker.fatal", errorCode: boundedErrorCode(error),
+    }));
     process.exitCode = 1;
   });
 }

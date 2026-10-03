@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applySecurityHeaders, hasAllowedMutationOrigin, isJsonRequest } from "@/server/security";
+import { applySecurityHeaders, hasAllowedApiHost, hasAllowedMutationOrigin, isJsonRequest } from "@/server/security";
 
 describe("mutation request safeguards", () => {
   const origin = "https://monitor.example.com";
@@ -15,6 +15,12 @@ describe("mutation request safeguards", () => {
     expect(hasAllowedMutationOrigin(sameOrigin, origin)).toBe(true);
     expect(isJsonRequest(sameOrigin)).toBe(true);
     expect(hasAllowedMutationOrigin(otherOrigin, origin)).toBe(false);
+  });
+
+  it("accepts only the configured Host header for API routes", () => {
+    expect(hasAllowedApiHost(new Request(origin, { headers: { host: "monitor.example.com" } }), origin)).toBe(true);
+    expect(hasAllowedApiHost(new Request(origin, { headers: { host: "attacker.example" } }), origin)).toBe(false);
+    expect(hasAllowedApiHost(new Request(origin), origin)).toBe(false);
   });
 
   it("adds browser response protections", () => {

@@ -40,11 +40,12 @@ COPY --from=build --chown=monitor:monitor /app/dist/worker ./dist/worker
 USER monitor
 CMD ["node", "dist/worker/index.js"]
 
-# Migrations intentionally retain their CLI dependency but exclude application
-# source, test files, Git metadata, and local environment files.
+# The migration target installs only its pinned CLI. Unlike the build stage it
+# does not carry TypeScript, Next.js tooling, source, or test dependencies.
 FROM runtime-base AS migrate
-COPY --from=dependencies --chown=monitor:monitor /app/node_modules ./node_modules
-COPY --from=build --chown=monitor:monitor /app/package.json ./package.json
-COPY --from=build --chown=monitor:monitor /app/db/migrations ./db/migrations
+RUN npm install --global --omit=dev --ignore-scripts node-pg-migrate@8.0.4 \
+  && npm cache clean --force
+COPY --chown=monitor:monitor package.json ./package.json
+COPY --chown=monitor:monitor db/migrations ./db/migrations
 USER monitor
-CMD ["npm", "run", "migrate"]
+CMD ["node-pg-migrate", "up", "--migrations-dir", "db/migrations", "--database-url-var", "MIGRATION_DATABASE_URL"]

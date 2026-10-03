@@ -2,6 +2,7 @@ import { request as httpRequest, type RequestOptions as HttpRequestOptions } fro
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { resolve4, resolve6 } from "node:dns/promises";
+import { performance } from "node:perf_hooks";
 import type { IncomingMessage } from "node:http";
 
 import { validatePublicAddresses } from "./address.js";
@@ -26,6 +27,7 @@ export interface AddressResolver {
 export interface ProbeDependencies {
   resolver?: AddressResolver;
   request?: typeof httpRequest;
+  /** Monotonic millisecond clock; inject only for deterministic tests. */
   now?: () => number;
   signal?: AbortSignal;
 }
@@ -36,6 +38,26 @@ const timeoutError = Object.assign(new Error("Probe deadline exceeded."), { code
 
 function elapsed(startedAt: number, now: () => number): number {
   return Math.max(0, Math.round(now() - startedAt));
+}
+
+function hostnameForConnection(hostname: string): string {
+  return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+}
+
+export function createPinnedLookup(address: string, family: 4 | 6) {
+  return (
+    _hostname: string,
+    options: { all?: boolean | undefined },
+    callback: (error: Error | null, address: string | Array<{ address: string; family: 4 | 6 }>, family?: 4 | 6) => void,
+  ): void => {
+    // Node 24 can request `all: true` for connection racing. Return only the
+    // validated pinned address in either callback shape.
+    if (options.all) {
+      callback(null, [{ address, family }]);
+      return;
+    }
+    callback(null, address, family);
+  };
 }
 
 function withDeadline<T>(promise: Promise<T>, remainingMs: number): Promise<T> {
@@ -79,20 +101,21 @@ async function resolveTarget(
   deadlineAt: number,
   now: () => number,
 ): Promise<{ address: string; family: 4 | 6 }> {
-  const literalFamily = isIP(hostname);
+  const literalHostname = hostnameForConnection(hostname);
+  const literalFamily = isIP(literalHostname);
   if (literalFamily === 4 || literalFamily === 6) {
-    if (!validatePublicAddresses([hostname])) {
+    if (!validatePublicAddresses([literalHostname])) {
       throw new TargetBlockedError();
     }
-    return { address: hostname, family: literalFamily };
+    return { address: literalHostname, family: literalFamily };
   }
 
   let addresses: [string[], string[]];
   try {
     addresses = await withDeadline(
       Promise.all([
-        resolveFamily(resolver.resolve4.bind(resolver), hostname),
-        resolveFamily(resolver.resolve6.bind(resolver), hostname),
+        resolveFamily(resolver.resolve4.bind(resolver), literalHostname),
+        resolveFamily(resolver.resolve6.bind(resolver), literalHostname),
       ]),
       deadlineAt - now(),
     );
@@ -160,9 +183,10 @@ function makeRequest(
   signal: AbortSignal | undefined,
 ): Promise<{ statusCode: number; responseTimeMs: number }> {
   return new Promise((resolve, reject) => {
+    const hostname = hostnameForConnection(target.hostname);
     const options: HttpRequestOptions & { servername?: string; rejectUnauthorized?: boolean } = {
       protocol: target.protocol,
-      hostname: target.hostname,
+      hostname,
       port: target.port || undefined,
       path: `${target.pathname}${target.search}`,
       method: "GET",
@@ -172,8 +196,10 @@ function makeRequest(
         Accept: "*/*",
         "User-Agent": "cloud-health-monitor/1.0",
       },
-      lookup: (_hostname, _options, callback) => callback(null, address, family),
-      servername: target.hostname,
+      lookup: createPinnedLookup(address, family) as HttpRequestOptions["lookup"],
+      // SNI is meaningful only for a DNS name. Node rejects an IP SNI value,
+      // while certificate verification remains enabled for literal targets.
+      ...(isIP(hostname) === 0 ? { servername: hostname } : {}),
       rejectUnauthorized: true,
     };
     let settled = false;
@@ -222,7 +248,7 @@ export async function probeHttp(
   deadlineMs = 10_000,
   dependencies: ProbeDependencies = {},
 ): Promise<ProbeResult> {
-  const now = dependencies.now ?? Date.now;
+  const now = dependencies.now ?? performance.now.bind(performance);
   const startedAt = now();
   const deadlineAt = startedAt + deadlineMs;
   try {

@@ -1,19 +1,22 @@
 import { CreateServiceRequestSchema, IdempotencyKeySchema } from "@/shared/contracts";
 import { normalizeServiceUrl, UrlValidationError } from "@/shared/url";
-import { createService, getServiceSummaries, getWorkerSummary } from "@/server/query-services";
+import { createService, getDatabaseNow, getServiceSummaries, getWorkerSummary } from "@/server/query-services";
 import { AppError, createRequestId, validationError } from "@/server/errors";
 import { parseServerEnv } from "@/server/env";
-import { hasAllowedMutationOrigin, isJsonRequest } from "@/server/security";
+import { hasAllowedApiHost, hasAllowedMutationOrigin, isJsonRequest } from "@/server/security";
 
 import { errorResponse, json, readJson } from "../_lib/route";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: Request) {
   const requestId = createRequestId();
   try {
-    const now = new Date();
+    if (!hasAllowedApiHost(request)) {
+      throw new AppError({ code: "ORIGIN_FORBIDDEN", message: "API host is not allowed.", status: 403 });
+    }
+    const now = await getDatabaseNow();
     const [services, worker] = await Promise.all([getServiceSummaries(now), getWorkerSummary(now)]);
     const fleet = { up: 0, down: 0, pending: 0, stale: 0 };
     for (const service of services) fleet[service.status] += 1;
@@ -35,6 +38,9 @@ export async function GET() {
 export async function POST(request: Request) {
   const requestId = createRequestId();
   try {
+    if (!hasAllowedApiHost(request)) {
+      throw new AppError({ code: "ORIGIN_FORBIDDEN", message: "API host is not allowed.", status: 403 });
+    }
     if (!hasAllowedMutationOrigin(request)) {
       throw new AppError({ code: "ORIGIN_FORBIDDEN", message: "Mutations must come from this application origin.", status: 403 });
     }

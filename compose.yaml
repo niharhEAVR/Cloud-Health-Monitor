@@ -1,3 +1,16 @@
+x-runtime-environment: &runtime-environment
+  APP_ORIGIN: ${APP_ORIGIN:?Set APP_ORIGIN in .env}
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
+  DATABASE_CONNECTION_TIMEOUT_MS: ${DATABASE_CONNECTION_TIMEOUT_MS:-5000}
+  DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-10000}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-5}
+  WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-45}
+  WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-1000}
+  WORKER_SHUTDOWN_GRACE_MS: ${WORKER_SHUTDOWN_GRACE_MS:-25000}
+  MAX_SERVICES: ${MAX_SERVICES:-100}
+
 services:
   db:
     image: postgres:17.6-alpine
@@ -28,9 +41,10 @@ services:
     build:
       context: .
       target: migrate
-    env_file: .env
     environment:
       NODE_ENV: production
+      # The migration credential intentionally exists only in this one-shot service.
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:?Set MIGRATION_DATABASE_URL in .env}
     depends_on:
       db:
         condition: service_healthy
@@ -49,8 +63,8 @@ services:
     build:
       context: .
       target: web
-    env_file: .env
     environment:
+      <<: *runtime-environment
       NODE_ENV: production
       PORT: "3000"
       HOSTNAME: 0.0.0.0
@@ -70,7 +84,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "node -e \"fetch('http://127.0.0.1:3000/api/health/live').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\"",
+          "node -e \"const http = require('node:http'); const host = new URL(process.env.APP_ORIGIN).host; const request = http.get('http://127.0.0.1:3000/api/health/live', { headers: { host } }, (response) => process.exit(response.statusCode === 200 ? 0 : 1)); request.on('error', () => process.exit(1));\"",
         ]
       interval: 10s
       timeout: 5s
@@ -89,8 +103,8 @@ services:
     build:
       context: .
       target: worker
-    env_file: .env
     environment:
+      <<: *runtime-environment
       NODE_ENV: production
     depends_on:
       db:
@@ -102,7 +116,13 @@ services:
       # The worker needs controlled outbound access to probe public targets.
       - probe_egress
     healthcheck:
-      test: ["CMD-SHELL", "kill -0 1"]
+      # A fresh heartbeat verifies that a worker loop, not just the init process,
+      # is connected and making scheduler progress.
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"const { Client } = require('pg'); const client = new Client({ connectionString: process.env.DATABASE_URL }); client.connect().then(() =\u003e client.query(\\\"SELECT EXISTS (SELECT 1 FROM worker_heartbeats WHERE last_seen_at > now() - interval '30 seconds') AS fresh\\\")).then(({ rows }) =\u003e client.end().then(() =\u003e process.exit(rows[0].fresh ? 0 : 1))).catch(() =\u003e client.end().catch(() =\u003e undefined).finally(() =\u003e process.exit(1)))\"",
+        ]
       interval: 15s
       timeout: 5s
       retries: 4
